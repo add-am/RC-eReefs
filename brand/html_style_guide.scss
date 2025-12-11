@@ -1,0 +1,48 @@
+/*-- scss:defaults --*/
+
+$callout-color-note: #27ced7; //aqua (bubble)
+$callout-color-tip: #27ced7; //aqua (bubble)
+$callout-color-caution: #27ced7; //aqua (bubble)
+$callout-color-warning: #27ced7; //aqua (bubble)
+$callout-color-important: #27ced7; //aqua (bubble)
+
+$link-color: #27ced7; //aqua (bubble)
+
+$toc-active-border: #27ced7; //aqua (bubble)
+$toc-inactive-border: #4f7795; //cool blue (blue steele)
+
+/*-- scss:rules --*/
+
+.quarto-title, .quarto-title-banner, h1, h2, h3, h4, h5, h6 {
+  color: #802919 !important; //red/brown (red earth)
+}
+
+.quarto-title-meta-heading, .header-section-number {
+  color: #802919; //red/brown (red earth)
+}
+
+.subtitle.lead, .description, .quarto-title-meta-contents, .btn.code-tools-button.dropdown-toggle {
+  color: black;
+}
+
+.quarto-title-block .quarto-title-banner{
+  background-image: url(brand/hwp_logo.png);
+  background-size: calc(100% / 4.5);
+  background-position: left;
+  background-repeat: no-repeat;
+  padding-left: 10px;
+  background-origin: content-box;
+  background-color: #ffffff;
+  color: #802919; //red/brown (red earth)
+}
+
+@font-face {
+  font-family: 'Metropolis';
+  src: url('brand/fonts/Metropolis-Regular.otf') format('opentype');
+  font-weight: normal;
+  font-style: normal;
+}
+
+body {
+  font-family: 'Metropolis', sans-serif;
+}
