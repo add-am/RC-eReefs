@@ -1,0 +1,495 @@
+---
+title: "Northern Three Spatial Analyses (eReefs Stars Method Workflow)"
+author: "Adam Shand"
+date: "`r format(Sys.time(), '%d, %B, %Y')`"
+format: html
+params:
+  project_crs: "EPSG:7844"
+  target_fyear: 2024
+---
+
+::: {.callout-note}
+This is one part of several scripts exploring CSIRO ereefs data. 
+:::
+
+# Introduction
+
+This script provides a general workflow when using the stars R package for handling curvilinear eReefs datasets. The stars package boasts its ability to natively handling non-regular gridded datasets without mandating warping/transformations.
+
+The script demonstrates how to:
+
+ - Download curvilinear data from the NCI database
+ - Perform generic data handling steps such querying, cropping, and saving
+ - Perform tasks such as mapping, and analysis
+        
+# Script Set Up
+
+This script requires multiple core spatial packages, each of which is loaded below. Key variables and paths are also created.
+
+```{r}
+#| label: load packages
+
+#use pacman function to load and install (if required) all other packages
+pacman::p_load(tidyverse, glue, here, janitor, sf, tmap, stars, ncmeta, ereefs, ggplot2, viridis, ggthemes)
+
+#load in the custom function used to create the read and write folders for the script
+source(here("functions/script_setup.R"))
+
+#run the function to create the folders and paths
+script_setup()
+
+#set project crs
+proj_crs <- params$project_crs
+
+#turn off s2 geometry
+sf_use_s2(FALSE)
+
+```
+
+# Load Data
+
+Now the script is set up we need to load in all of the required datasets. This will be broken into two segments:
+
+ - Spatial data specific to the N3 region - such as the region, basin, and sub basin boundaries.
+ - eReefs data
+
+## Spatial Data
+
+Spatial data for the northern three regions should be readily available in the repo, the dataset is created by the n3_region-builder.qmd script in the repo that should be the first script run for new users. If the dataset is not available refer back to the README document in the GitHub repo. The other parts of spatial data here should go off without a hitch if the region-builder script has been run.
+
+```{r}
+#| label: load the n3 region
+
+#read in the northern three spatial files and reduce down to only the components we need
+n3_marine_region <- n3_region |> 
+  filter(Environment == "Marine")
+
+```
+
+## eReefs Data - NCI version
+
+Now we can download the NCI data from the server. We are going to download temperature data for the entire GBR, from a random date, at the surface, with 1/3 resolution. We are using temperature data as that is easy to "sanity check" and spot errors. The metadata for temperature looks like this:
+
+```{r}
+#| label: Download temperature data
+
+#establish the initial file path using the ereefs package
+#input_file <- substitute_filename("catalog")
+input_file <- "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml"
+
+#read in file, use temp variable and get all lat long, pick surface (44) and a random date (100), downsample to reduce size
+nc_temp <- read_ncdf(input_file, var = "temp", 
+                ncsub = cbind(start = c(1, 1, 44, 100),
+                              count = c(510, 2388, 1, 1)),
+                downsample = 2)
+
+#look at dataset
+nc_temp
+
+```
+
+And the actual data visualized looks like this:
+
+```{r}
+#| label: plot temperature data
+
+#view
+plot(nc_temp)
+
+```
+
+Looking at this plot, even in black and white, we can immediately tell things are looking roughly correct. We can easily see the coastline, and the temperature increase as we head north. Now we will also download chlorophyll data as well to test how difficult it will be to handle data that we actually intend on using. The download process is the same, and the metadata for Chlorophyll looks like this:
+
+```{r}
+#| label: download chla data
+
+#download chla data
+nc_chla <- read_ncdf(input_file, var = "Chl_a_sum", 
+                ncsub = cbind(start = c(1, 1, 44, 100),
+                              count = c(510, 2388, 1, 1)),
+                downsample = 2)
+
+nc_chla
+
+```
+
+Interestingly, you may have already spotted in the metadata, something is up. This is more apparent in the visualisation below:
+
+```{r}
+#| label: plot chla data
+
+#view
+plot(nc_chla)
+
+```
+
+There is something wildly off about the scale. The cause of this is that for some reason the values that should be read as NA by the stars package are instead assigned incredibly high numbers such as 1e+35 (35 zeros to the left of the decimal). To give a better example of why this sucks, here it is mapped using my preferred tools:
+
+```{r}
+#| label: map chla again
+
+tm_shape(nc_chla) +
+  tm_raster(col.scale = tm_scale_continuous(), 
+            col.legend = tm_legend(reverse = T)) + 
+  tm_layout(legend.outside = T)
+
+```
+
+Thankfully this can easily be fixed by setting all values above and arbitrary value to be NA.
+
+```{r}
+#| label: set values to NA
+
+#set values to NA
+nc_chla[(nc_chla > 100)] <- NA
+
+plot(nc_chla)
+
+```
+
+Fixed!
+
+## Testing functionality
+
+Moving into testing we will perform a variety of actions on either the temperature or the chla dataset, noting that both should react the same way.
+
+### Warping
+
+The first thing we want to cover is warping (and more importantly, why we cant warp currently). Basically when we attempt to warp the function is throwing an error because there are NA values within the lat and/or long values for the dataset. The first method returns the error:
+
+```{r}
+#| label: testing warping
+#| error: true
+
+#create a grid for the data to be warped too
+nc_temp_grid <- nc_temp |> st_transform(st_crs(nc_temp)) |> st_bbox() |> st_as_stars()
+
+#attempt to warp data
+nc_temp_warped <- st_warp(src = nc_temp, dest = nc_temp_grid, use_gdal = T)
+
+```
+
+And the follow up from this error returns the new error:
+
+```{r}
+#| label: test warping 2
+#| error: true
+
+#try the gdal method
+gdal_utils(util = "warp", source = "nc_temp", destination = paste0(tempfile(), ".nc"))
+
+```
+
+Which we believe is caused by NA values. Currently we have no good way of replacing NA values with the correct coordinates.
+
+### Plotting
+
+As you might have noticed above, we can of course do basic mapping using native R functions:
+
+```{r}
+#| label: basic mapping
+#| error: true
+
+plot(nc_temp)
+
+```
+
+However what we really want to know if how hard it is to manipulate the maps. Looks like we can use ggplot:
+
+```{r}
+#| label: try manipulate the maps
+
+ggplot() + 
+  geom_stars(data = nc_temp[1], alpha = 0.8) + 
+  scale_fill_viridis()
+
+```
+
+And, thankfully, we can also use tmap - my favorite.
+
+```{r}
+#| label: test tmap
+
+tm_shape(nc_temp) + 
+  tm_raster(col.scale = tm_scale_continuous(),
+            col.legend = tm_legend(reverse = T)) + 
+  tm_layout(legend.outside = T)
+
+```
+
+### Cropping
+
+It is one thing to be able to map, but what about mapping the location that we want (via cropping)?
+
+```{r}
+#| label: test cropping
+
+#update crs
+nc_chla <- st_transform(nc_chla, proj_crs)
+
+#crop
+nc_chla_n3 <- st_crop(nc_chla, n3_marine_region, na.rm = T)
+
+#plot
+tm_shape(nc_chla_n3) + 
+  tm_raster(col.scale = tm_scale_continuous(), 
+            col.legend = tm_legend(reverse = T)) + 
+  tm_layout(legend.outside = T) +
+  tm_shape(n3_marine_region, is.main = T) + 
+  tm_borders()
+
+```
+
+...Kinda, we can "crop" the data by making all cells outside the area NA, but they are still there. So the extend remains unchanged. To be able to zoom into our cropped location we have to make our cropping layer the master layer.
+
+Below is a slightly pretty version, that we will also save.
+
+```{r}
+#| label: plot the same map with a nice style
+
+#cut to only DT area
+dt_region <- n3_marine_region |> 
+  filter(Region %in% c("Dry Tropics", "Burdekin"))
+
+#crop to the area
+nc_chla_dt <- st_crop(nc_chla_n3, dt_region, na.rm = T)
+
+#plot
+dt_map <- tm_shape(qld) +
+  tm_polygons(fill = "grey80", 
+              col = "black") +
+  tm_shape(nc_chla_dt) + 
+  tm_raster(col.scale = tm_scale_continuous(values = "brewer.bu_gn"), 
+            col.legend = tm_legend(reverse = T)) + 
+  tm_layout(legend.outside = T) +
+  tm_shape(dt_region, is.main = T) + 
+  tm_borders(col = "black")
+
+dt_map
+
+tmap_save(dt_map, glue("{output_path}/dt_example_map.png"))
+
+```
+
+#### Cropping: AIMS/stars Version
+
+However this brings up a new challenge to think about. If we are trying to get multiple datasets (time steps) for a small area, do we have to download the entire GBR for each date and then convert values to NA? This would be quite slow.
+
+Thankfully, there is a new method that has been identified that utilizes the internals of an aims ereefs function, and the stars download method to pre-crop data before downloading. First we use the a very handy function `get_ereefs_grids()` to pull in all grid information (x y and z). These are named matrices of all lat (y) and long (x) values.
+
+```{r}
+#| label: get grid information
+
+#get all grids
+grids <- get_ereefs_grids(input_file)
+
+#show names
+names(grids)
+
+#get x and y specifically
+x_grid <- grids[["x_grid"]]
+y_grid <- grids[["y_grid"]]
+
+```
+
+Once we have these matrices we then need to find the position of the lats and longs in these matrices that best match our cropping boundaries. To do this we will:
+
+ - create an array of TRUE/FALSE values the same size as the matrices
+        + assign TRUE to the array if the grid value in that same positions is outside our boundary
+        + assign FALSE to the array if the grid value in that same positions is inside our boundary
+
+```{r}
+#| label: create TRUE/FALSE array
+
+#set bounding box, order is min lon, max lon, min lat, max lat
+box_bounds <- c(145, 150, -22, -16)
+
+#create an array of FALSE values the same dimensions as the x (and y) grids
+outOfBox <- array(FALSE, dim = dim(x_grid))
+
+#change array value to TRUE if the associated value in the x or y grid at the same position is outside our bounding box
+if (!is.na(box_bounds[1])) {outOfBox <- apply(x_grid, 2, function(x) {(x < box_bounds[1] | is.na(x))})}
+if (!is.na(box_bounds[2])) {outOfBox <- outOfBox | apply(x_grid, 2, function(x) {(x > box_bounds[2] | is.na(x))})}
+if (!is.na(box_bounds[3])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x < box_bounds[3] | is.na(x))})}
+if (!is.na(box_bounds[4])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x > box_bounds[4] | is.na(x))})}
+
+```
+
+Then once we have this T/F array (which has more than a million entries btw) we invert the T/F vals and ask:
+
+ - what is the first instance of a row having at least one TRUE val
+ - how may rows have at least one T val
+ - what is the first instance of a col having at least one TRUE val
+ - how many cols have at least one T val
+
+```{r}
+#| label: find outer limits of T positions
+
+#for apply(): first arg is an array, second arg is "margin" (how to apply func), 1 = rows, 2 = columns, third arg is the func to apply
+#we invert the TRUE/FALSE vals in array using "!"
+#we use any() to ask which values are true
+#we use which() to return the position of true values in a vector array
+#we use [1] to take first entry (not suppling a [] arg returns all entries)
+
+#find the first x position (row) that is inside the bounding box (i.e. the first row with at least one TRUE val)
+xmin <- which(apply(!outOfBox, 1, any))[1]
+
+#find all (rows) inside the bounding box (i.e. all rows with at least one TRUE val) then take the last using length() as the index
+xmax <- which(apply(!outOfBox, 1, any))
+xmax <- xmax[length(xmax)]
+
+#find the first y position (col) that is inside the bounding box (i.e. the first col with at least one TRUE val)
+ymin <- which(apply(!outOfBox, 2, any))[1]
+
+#find all (cols) inside the bounding box (i.e. all cols with at least one TRUE val) then take the last using length() as the index
+ymax <- which(apply(!outOfBox, 2, any))
+ymax <- ymax[length(ymax)]
+
+```
+
+Using this output we can then have our coords translated into the start and count values that are used to query NetCDF files.
+
+```{r}
+#| label: crop NetCDF before downloading
+
+#extract cropped version
+nc_chla_pre_cropped <- read_ncdf(input_file, var = "Chl_a_sum", 
+                                 ncsub = cbind(start = c(xmin, ymin, 44, 100),
+                                               count = c((xmax - xmin), (ymax - ymin), 1, 1)))
+
+```
+
+and plotted.
+
+```{r}
+#| label: plot the cropped before downloading version
+
+#update crs
+nc_chla_pre_cropped <- st_transform(nc_chla_pre_cropped, proj_crs)
+
+#overwrite the "fake" NA values
+nc_chla_pre_cropped[(nc_chla_pre_cropped > 100)] <- NA
+
+#plot
+tm_shape(qld) +
+  tm_polygons(fill = "grey80", 
+              col = "black") +
+  tm_shape(nc_chla_pre_cropped, is.main = T) + 
+  tm_raster(col.scale = tm_scale_continuous(values = "brewer.bu_gn"),
+            col.legend = tm_legend(reverse = T)) + 
+  tm_layout(legend.outside = T)
+
+```
+
+### Extracting Values
+
+The final thing that we are concerned about is if we can extract values, both as a point, and as a mean of a random area.
+
+```{r}
+#| label: test value extraction
+
+#create a point
+pnt <- st_sfc(st_point(c(146.4346, -18.8168)), crs = st_crs(nc_temp))
+
+#extract a value
+extracted_val <- st_extract(nc_temp, pnt)
+
+#get area versions
+area_from_point <- function(numeric_pair, area = 0.15){
+  coord_out <- st_polygon(list(cbind(c(numeric_pair[1] - area/2, numeric_pair[1] - area/2, 
+                                       numeric_pair[1] + area/2, numeric_pair[1] + area/2, 
+                                       numeric_pair[1] - area/2), 
+                                     c(numeric_pair[2] + area/2, numeric_pair[2] - area/2, 
+                                       numeric_pair[2] - area/2, numeric_pair[2] + area/2, 
+                                       numeric_pair[2] + area/2)))) |> st_sfc(crs = st_crs(nc_temp))
+  }
+  
+#run function
+poly <- area_from_point(c(146.4346, -18.8168))
+
+#extract a value
+extracted_val_2 <- st_extract(nc_temp, poly, fun = mean)
+
+extracted_val
+
+```
+
+Both of which appear to be possible.
+
+```{r}
+#| label: test value extraction 2
+
+extracted_val_2
+
+```
+
+Here is an example of multiple point extraction as well.
+
+```{r}
+#| label: create a loop extraction
+
+#create a list of points
+pnts <- st_as_sf(
+  x = data.frame(point = c("1","2","3"), lon = seq(146.4346, 146.4746, 0.02), lat = seq(-18.8598, -18.8198, 0.02)),
+  coords = c("lon", "lat"),
+  crs = st_crs(nc_temp)
+  )
+
+#extract a value
+extracted_val_3 <- st_extract(nc_temp, pnts)
+
+```
+
+And in a nice tabular format as well.
+
+```{r}
+#| label: change extract to table
+
+pres_tbl <- extracted_val_3 |> 
+  dplyr::select(temp)
+
+data.frame(pres_tbl)
+
+```
+
+#### Exracting Values: AIMS/stars Version
+
+We have also identified a new method mixing stars and aims together that does not require the full dataset to be downloaded first. Steps are as follows:
+
+ - Use the aims `get_params()` function to extract a full list of lat and long values
+ - Match our point coords to lat and long values and extract their position in the lat/long lists
+ - Use the positions to extract a point value from the NetCDF data without having to download the full data
+
+```{r}
+#| label: extract point data using new method
+
+#create a dataframe of a lat and lon value
+location_latlon = data.frame(latitude = -21.1488, longitude = 150.9397)
+
+#create an arbitrary start and end date - this is just to satisfy the get_params() function, we dont actually use the dates
+start_date <- c(2023, 02, 12)
+end_date <- c(2023, 02, 12)
+
+#extract parameters (we only car about the latitude and longitude extracts)
+ereefs:::assignList(ereefs:::get_params(start_date, end_date, input_file, "temp"))
+
+#determine the index of the point coord
+grid_index <- apply(location_latlon, 1, function(ll) which.min((latitude - ll[1])^2 + (longitude - ll[2])^2))
+
+#convert this index into a grid point
+location_grid <- cbind(floor((grid_index + dim(latitude)[1] - 1)/dim(latitude)[1]), 
+                       (grid_index + dim(latitude)[1] - 1)%%dim(latitude)[1] + 1)
+
+#download data at the specific grid point
+nc_temp_point <- read_ncdf(input_file, var = "temp", 
+                ncsub = cbind(start = c(location_grid[2], location_grid[1], 44, 100),
+                              count = c(1, 1, 1, 1)))
+#show as a stars object
+nc_temp_point
+
+#and as a dataframe
+data.frame(nc_temp_point)
+
+```
+
+So in summary, it now appears that a transformation of the curvilinear grid is no longer required for any aspect of the work that we intend to do, from mapping to data extraction and analysis. We can do it all.

@@ -1,0 +1,449 @@
+---
+title: "Northern Three Spatial Analyses (eReefs Stars Method Presentation)"
+author: "Adam Shand"
+date: "`r format(Sys.time(), '%d, %B, %Y')`"
+format: html
+params:
+  project_crs: "EPSG:7844"
+  target_fyear: 2024
+---
+
+::: {.callout-note}
+This is one part of several scripts exploring CSIRO ereefs data. 
+:::
+
+# Introduction
+
+This script provides detailed examples for producing eReefs outputs such as maps, graphs, and animation.
+
+# Script Set Up
+
+This script requires multiple core spatial packages, each of which is loaded below. Key variables and paths are also created.
+
+```{r}
+#| label: load packages
+
+#use pacman function to load and install (if required) all other packages
+pacman::p_load(tidyverse, glue, here, janitor, sf, tmap, stars, ncmeta, ereefs, ggplot2, gganimate, gifski)
+
+#load in the custom function used to create the read and write folders for the script
+source(here("functions/script_setup.R"))
+
+#run the function to create the folders and paths
+script_setup()
+
+#set project crs
+proj_crs <- params$project_crs
+
+#turn off s2 geometry
+sf_use_s2(FALSE)
+
+```
+
+# Load Data
+
+Now the script is set up we need to load in all of the required datasets. This will be broken into two segments:
+
+ - Spatial data specific to the N3 region - such as the region, basin, and sub basin boundaries.
+ - eReefs data
+
+## Spatial Data
+
+Spatial data for the northern three regions should be readily available in the repo, the dataset is created by the n3_region-builder.qmd script in the repo that should be the first script run for new users. If the dataset is not available refer back to the README document in the GitHub repo. The other parts of spatial data here should go off without a hitch if the region-builder script has been run.
+
+```{r}
+#| label: load the n3 region
+#| output: FALSE
+
+#read in the northern three spatial files and reduce down to only the components we need
+n3_land_region <- n3_region |> 
+  filter(Environment != "Marine") |> 
+  group_by(SubBasinOrSubZone) |> summarise(geometry = st_union(geom)) |> 
+  ungroup() |> st_cast()
+
+#get the boundary for the great barrier reef marine park
+gbrmpa_bound <- get(data("gbr_bounds", package = "gisaimsr"))
+
+```
+
+## eReefs Data
+
+Now we can download several layers of eReefs data.
+
+```{r}
+#| label: Download temperature data
+
+#set bounding box, order is min lon, max lon, min lat, max lat
+box_bounds <- c(145, 150, -22, -16)
+  
+#establish the initial file path using the ereefs package
+#input_file <- substitute_filename("catalog")
+input_file <- "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml"
+  
+#get all grids
+grids <- get_ereefs_grids(input_file)
+  
+#get x and y specifically
+x_grid <- grids[["x_grid"]]
+y_grid <- grids[["y_grid"]]
+  
+#create an array of FALSE values the same dimensions as the x (and y) grids
+outOfBox <- array(FALSE, dim = dim(x_grid))
+  
+#change array value to TRUE if the associated value in the x or y grid at the same position is outside our bounding box
+if (!is.na(box_bounds[1])) {outOfBox <- apply(x_grid, 2, function(x) {(x < box_bounds[1] | is.na(x))})}
+if (!is.na(box_bounds[2])) {outOfBox <- outOfBox | apply(x_grid, 2, function(x) {(x > box_bounds[2] | is.na(x))})}
+if (!is.na(box_bounds[3])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x < box_bounds[3] | is.na(x))})}
+if (!is.na(box_bounds[4])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x > box_bounds[4] | is.na(x))})}
+  
+#find the first x position (row) that is inside the bounding box (i.e. the first row with at least one TRUE val)
+xmin <- which(apply(!outOfBox, 1, any))[1]
+  
+#find all (rows) inside the bounding box (i.e. all rows with at least one TRUE val) then take the last using length() as the index
+xmax <- which(apply(!outOfBox, 1, any))
+xmax <- xmax[length(xmax)]
+  
+#find the first y position (col) that is inside the bounding box (i.e. the first col with at least one TRUE val)
+ymin <- which(apply(!outOfBox, 2, any))[1]
+  
+#find all (cols) inside the bounding box (i.e. all cols with at least one TRUE val) then take the last using length() as the index
+ymax <- which(apply(!outOfBox, 2, any))
+ymax <- ymax[length(ymax)]
+  
+#extract chla data as it looks cool, and temp data as the scale is intuitive
+nc_chla <- read_ncdf(input_file, var = "Chl_a_sum", 
+                     ncsub = cbind(start = c(xmin, ymin, 44, 100),
+                                   count = c((xmax - xmin), (ymax - ymin), 1, 1)))
+  
+nc_temp <- read_ncdf(input_file, var = "temp", 
+                       ncsub = cbind(start = c(xmin, ymin, 44, 100),
+                                     count = c((xmax - xmin), (ymax - ymin), 1, 1)))
+  
+#overwrite erraneous low values, for the purpose of the mapping only
+nc_chla[(nc_chla > 100)] <- NA
+nc_temp[(nc_temp < 20)] <- NA
+  
+#update the name of the layer for the legend in the map
+names(nc_chla) <- "Chla ug/L"
+names(nc_temp) <- "Temp. °C"
+  
+#clean up
+rm(box_bounds, input_file, grids, x_grid, y_grid, outOfBox, xmin, xmax, ymin, ymax)
+
+```
+
+# Single Maps
+
+First we will create the stylish, single, static maps.
+
+```{r}
+#| label: create stylish single maps
+
+#create the map
+temp_map <- tm_shape(qld) +
+  tm_polygons(fill = "grey80", 
+              col = "black") +
+  tm_grid(alpha = 0, 
+          labels.show = T, 
+          labels.cardinal = T, 
+          col = "black") +
+  tm_xlab("Longitude", 
+          size = 0.7) +
+  tm_ylab("Latitude", 
+          size = 0.7) +
+  tm_shape(nc_temp, is.main = T) +
+  tm_raster(col.scale = tm_scale_continuous(values = "-brewer.rd_yl_bu"),
+            col.legend = tm_legend(reverse = T)) +
+  tm_shape(n3_land_region) +
+  tm_polygons(fill = "grey95", 
+              col = "black") +
+  tm_shape(gbrmpa_bound) +
+  tm_borders(lty = "dashed", 
+             col = "black") +
+  tm_layout(legend.frame = T, 
+            legend.position = c("left", "bottom"), 
+            legend.bg.color = "White") +
+  tm_add_legend(type = "lines", 
+                lty = "dashed", 
+                col = "black", 
+                labels = "GBR Bounds")  +
+  tm_credits(text = "Depth: 0m, Date: 6th Mar 2020, Time: 12:00pm \nModel: eReefs GBR1 biogeochemistry and sediments v3.2",
+             position = c("right", "top"),
+             size = 0.5, 
+             col = "Black")
+
+#save
+tmap_save(temp_map, filename = glue("{output_path}/temperature_pretty.png"))
+
+#create the map
+chla_map <- tm_shape(qld) +
+  tm_polygons(fill = "grey80", 
+              col = "black") +
+  tm_grid(alpha = 0, 
+          labels.show = T, 
+          labels.cardinal = T, 
+          col = "black") +
+  tm_xlab("Longitude", 
+          size = 0.7) +
+  tm_ylab("Latitude", 
+          size = 0.7) +
+  tm_shape(nc_chla, is.main = T) +
+  tm_raster(col.scale = tm_scale_continuous(values = "-brewer.rd_yl_bu"),
+            col.legend = tm_legend(reverse = T)) +
+  tm_shape(n3_land_region) +
+  tm_polygons(fill = "grey95", 
+              col = "black") +
+  tm_shape(gbrmpa_bound) +
+  tm_borders(lty = "dashed", 
+             col = "black") +
+  tm_layout(legend.frame = T, 
+            legend.position = c("left", "bottom"), 
+            legend.bg.color = "White") +
+  tm_add_legend(type = "lines", 
+                lty = "dashed", 
+                col = "black", 
+                labels = "GBR Bounds")  +
+  tm_credits(text = "Depth: 0m, Date: 6th Mar 2020, Time: 12:00pm \nModel: eReefs GBR1 biogeochemistry and sediments v3.2",
+             position = c("right", "top"),
+             size = 0.5, 
+             col = "Black")
+
+#save
+tmap_save(chla_map, filename = glue("{output_path}/chla_pretty.png"))
+
+```
+
+Here is (roughly) how the maps looks.
+
+```{r}
+#| label: show pretty maps
+
+chla_map
+
+```
+
+
+# Animations
+
+Then we will download additional data in a smaller area for animations, both map and plot.
+
+```{r}
+#| label: download additional data
+
+#define our zoomed in area of interest
+area_of_interest <- c(150.5988, 151.3701, -21.0373, -20.5373)
+
+#input_file <- substitute_filename("catalog")
+input_file <- "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml"
+  
+#because the data is set out in a curved grid we need to then roughly double our area
+lon_buff <- abs(area_of_interest[1] - area_of_interest[2])
+lat_buff <- abs(area_of_interest[1] - area_of_interest[2])
+  
+#add the buffer
+aoi_buffer <- c(area_of_interest[1] - lon_buff, area_of_interest[2] + lon_buff,
+                area_of_interest[3] - lat_buff, area_of_interest[4] + lat_buff)
+
+#convert the area of interest into an sfc object
+area_of_interest <- st_as_sfc(st_bbox(c(xmin = area_of_interest[1], xmax = area_of_interest[2],
+                                        ymin = area_of_interest[3], ymax = area_of_interest[4]),
+                                      crs = proj_crs))
+  
+#get all grids for the entire dataset
+grids <- get_ereefs_grids(input_file)
+  
+#get x and y grid specifically
+x_grid <- grids[["x_grid"]]
+y_grid <- grids[["y_grid"]]
+  
+#create an array of FALSE values the same dimensions as the x (and y) grids
+outOfBox <- array(FALSE, dim = dim(x_grid))
+  
+#change array value to TRUE if the associated value in the x or y grid at the same position is outside our bounding box
+if (!is.na(aoi_buffer[1])) {outOfBox <- apply(x_grid, 2, function(x) {(x < aoi_buffer[1] | is.na(x))})}
+if (!is.na(aoi_buffer[2])) {outOfBox <- outOfBox | apply(x_grid, 2, function(x) {(x > aoi_buffer[2] | is.na(x))})}
+if (!is.na(aoi_buffer[3])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x < aoi_buffer[3] | is.na(x))})}
+if (!is.na(aoi_buffer[4])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x > aoi_buffer[4] | is.na(x))})}
+  
+#find the first x position (row) that is inside the bounding box (i.e. the first row with at least one TRUE val)
+xmin <- which(apply(!outOfBox, 1, any))[1]
+
+#find all (rows) inside the bounding box (i.e. all rows with at least one TRUE val) then take the last using length() as the index
+xmax <- which(apply(!outOfBox, 1, any))
+xmax <- xmax[length(xmax)]
+  
+#find the first y position (col) that is inside the bounding box (i.e. the first col with at least one TRUE val)
+ymin <- which(apply(!outOfBox, 2, any))[1]
+  
+#find all (cols) inside the bounding box (i.e. all cols with at least one TRUE val) then take the last using length() as the index
+ymax <- which(apply(!outOfBox, 2, any))
+ymax <- ymax[length(ymax)]
+  
+#extract buffered version
+chla_buffered <- read_ncdf(input_file, var = "Chl_a_sum", 
+                           ncsub = cbind(start = c(xmin, ymin, 44, 100),
+                                         count = c((xmax - xmin), (ymax - ymin), 1, 30)))
+  
+#overwrite the "fake" NA values
+chla_buffered[(chla_buffered > 100)] <- NA
+  
+#update crs
+chla_buffered <- st_transform(chla_buffered, proj_crs)
+  
+#crop to the actually area we are interested in
+nc_chla_zoomed <- st_crop(chla_buffered, area_of_interest)
+  
+#update the name of the layer for the legend in the map
+names(nc_chla_zoomed) <- "Chla ug/L"
+  
+#clean up
+rm(input_file, lon_buff, lat_buff, aoi_buffer, grids, x_grid, y_grid, outOfBox, 
+   xmin, xmax, ymin, ymax, chla_buffered)
+
+```
+
+## Map Animation 
+
+Now we will create said animations, with an additional static map to show where the animation is occurring:
+
+(Note the map animation cant be shown in the doc).
+
+```{r}
+#| label: create animations
+#| output: FALSE
+
+#create list to store maps
+map_list <- list()
+
+#loop through each layer and add to list
+for (i in 1:30){
+
+  #plot
+  tm_object <- tm_shape(nc_chla_zoomed[,,,,i]) + 
+    tm_raster(col.scale = tm_scale_intervals(values = "-brewer.spectral",
+                                               breaks = c(0, 0.5, 1, 1.5, 2)), 
+              col.legend = tm_legend(reverse = T)) +
+    tm_layout(legend.outside = T) +
+    tm_shape(area_of_interest, is.main = T) +
+    tm_polygons(fill_alpha = 0, 
+                col_alpha = 0)
+  
+  #append each to a list
+  map_list <- c(map_list, list(tm_object))
+  
+}
+
+#supply to the list of tmap objects to the animate function
+tmap_animation(map_list, filename =  glue("{output_path}/chla_map_animation.gif"), width = 500, height = 500, fps = 2)
+
+#create the map with the area of interest overlaid
+prety_chla <- tm_shape(qld) +
+  tm_polygons(fill = "grey80", 
+              col = "black") +
+  tm_grid(alpha = 0, 
+          labels.show = T, 
+          labels.cardinal = T, 
+          col = "black") +
+  tm_xlab("Longitude", 
+          size = 0.7) +
+  tm_ylab("Latitude", 
+          size = 0.7) +
+  tm_shape(nc_chla, is.main = T) +
+  tm_raster(col.scale = tm_scale_continuous(values = "-brewer.spectral"),
+            col.legend = tm_legend(reverse = T)) +
+  tm_shape(n3_land_region) +
+  tm_polygons(fill = "grey95", 
+              col = "black") +
+  tm_shape(gbrmpa_bound) +
+  tm_borders(lty = "dashed", 
+             col = "black") +
+  tm_shape(area_of_interest) +
+  tm_borders(col = "red", 
+             lwd = 2) +
+  tm_layout(legend.frame = T, 
+            legend.position = c("left", "bottom"), 
+            legend.bg.color = "White") +
+  tm_add_legend(type = "lines", 
+                lty = "dashed", 
+                col = "black", 
+                labels = "GBR Bounds")  +
+  tm_credits(text = "Depth: 0m, Date: 6th Mar 2020, Time: 12:00pm \nModel: eReefs GBR1 biogeochemistry and sediments v3.2",
+             position = c("right", "top"),
+             size = 0.5, 
+             col = "black")
+
+#save
+tmap_save(prety_chla, filename = glue("{output_path}/chla_pretty_aoi_overlay.png"))
+
+```
+
+```{r}
+#| label: show map with zoom spot
+
+prety_chla
+
+```
+
+## Plot Animation
+
+Then we will follow this up with an animation of a plot.
+
+```{r}
+#| label: create plot animations
+
+#extract data from the zoomed in area for each day
+chla_data_extract <- data.frame(st_extract(nc_chla_zoomed, area_of_interest, fun = mean))
+
+#create a line plot of the data
+plot <- ggplot(chla_data_extract, aes(x = time, y = Chla.ug.L)) +
+  geom_line(col = "Black", linewidth = 1.5) +
+  geom_point(col = "Red", size = 4) +
+  scale_y_continuous(breaks = c(0.5, 1, 1.5, 2), limits = c(0.8, 1.7), name = "Chla (ug/L)") +
+  scale_x_datetime(name = "", expand = c(0.01, 0.01)) +
+   theme(axis.text.x = element_text(colour = "black", size = 15),
+         axis.line.x = element_line(colour = "black"),
+         axis.text.y = element_text(colour = "black", size = 15),
+         axis.line.y = element_line(colour = "black"),
+         axis.title = element_text(colour = "black", size = 20),
+         axis.ticks.y = element_blank(),
+         panel.background = element_blank()) +
+  transition_reveal(time)
+  
+#the following code is hashed out as it does not seem to work for renders
+
+#animate the plot
+#animated_plot <- animate(plot, duration = 15, height = 250, width = 900)
+
+#save the plot (the last (most recent) animation that was made)
+#anim_save(glue("{output_path}/chla_plot_animation.gif"), animated_plot)
+
+#create a static version
+plot <- ggplot(chla_data_extract, aes(x = time, y = Chla.ug.L)) +
+  geom_line(col = "Black", linewidth = 1.5) +
+  geom_point(col = "Red", size = 4) +
+  scale_y_continuous(breaks = c(0.5, 1, 1.5, 2), limits = c(0.8, 1.7), name = "Chla (ug/L)") +
+  scale_x_datetime(name = "", expand = c(0.01, 0.01)) +
+   theme(axis.text.x = element_text(colour = "black", size = 15),
+         axis.line.x = element_line(colour = "black"),
+         axis.text.y = element_text(colour = "black", size = 15),
+         axis.line.y = element_line(colour = "black"),
+         axis.title = element_text(colour = "black", size = 20),
+         axis.ticks.y = element_blank(),
+         panel.background = element_blank()) 
+
+#and save
+ggsave(glue("{output_path}/chla_plot_static.png"), height = 75, width = 275, units = "mm")
+
+#we will also save the data to be inspected if needed
+chla_data_clean <- chla_data_extract |> 
+  dplyr::select(Chla.ug.L, time) |> 
+  separate_wider_delim(time, " ", names = c("date", NA)) |> 
+  rename(chla = Chla.ug.L) |> 
+  pivot_wider(names_from = date, values_from = chla)
+
+#save
+write_csv(chla_data_clean, glue("{output_path}/chla_example_data.csv"))
+
+```
+
+

@@ -1,0 +1,49 @@
+project:
+  output-dir: "renders" #where do we want the rendered files to be saved?
+  #render:
+  #  - "scripts/" #where are the scripts that we are targetting located?
+execute: 
+  output: false #should code chunk outputs be shown be default?
+date: "today" #what should the publication date be?
+date-format: long #what style, long = "October 8, 2024"
+toc: true #do we want a table of contents?
+toc-location: left #where should it be located?
+toc-depth: 4 #how many levels should it have? E.g. 1, 1.1, 1.1.1, 1.1.1.1
+title-block-banner: true #do we want a title block banner? (This has our HWP logo for html reports)
+include-after-body: "references/system_formatting/html_footer.html" #This contains footer material for html report (reuse, citations, logos, etc.)
+header-includes:  | 
+      <link rel="stylesheet" media="screen" href="https://fontlibrary.org//face/metropolis" type="text/css"/> 
+#above is the source for the font that the html reports use (metropolis)
+mainfont: MetropolisRegular #then this is also saying what font to use (both are needed for some reason)
+brand: "references/system_formatting/_brand.yml"
+filters:
+  - landscape #this is a custom extension that allows for pages to be made landscape using :::{.landscape} [content] :::
+resource-path: ["../../references/images"] #the file path to search for images in
+format: 
+  html:
+    other-links: 
+      - text: "Spatial Analysis Repository"
+        href: "https://github.com/Northern-3/spatial-analyses"
+        icon: github
+    code-fold: true
+    code-overflow: wrap
+    code-summary: "Expand to view code."
+    code-tools: true 
+    code-copy: true
+    code-block-border-left: "#2683C6" #cool blue (blue falls)
+    code-block-bg: "#2683C620" #cool blue (blue falls) at 20% opacity
+    embed-resources: true
+    toc-title: "Jump To:"
+    number-sections: true
+    monobackgroundcolor: "transparent"
+    theme: 
+      - flatly #one of the preset themes
+      - references/system_formatting/html_style_guide.scss #this is a custom theme using the HWP colours
+  docx: 
+    reference-doc: references/system_formatting/docx_style_guide.docx #this is a custom docx theme using HWP colours
+    toc-title: "Table of Contents"
+    number-sections: false
+    echo: false
+    fig-align: center
+    fig-height: 3.5
+    fig-dpi: 300

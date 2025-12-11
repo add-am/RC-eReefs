@@ -1,0 +1,763 @@
+---
+title: "Creating Contextual Results for the Offshore Marine Zone"
+subtitle: "A Healthy Waters Partnership Analysis"
+description: "This script has been written to create a series of contextual results to be included in the Offshore Marine Zone of the Technical Report."
+author: "Adam Shand" 
+format: html
+params:
+  project_crs: "EPSG:7844"
+  target_fyear: 2023
+  target_region: "Dry Tropics"
+  resolution: 0 #0 is full size, bigger number = more cells merge together
+  buffer: 1.2 #how much "extra" of the model do we want to get outside of the focus area
+---
+
+::: {.callout-note}
+This is one part of several scripts exploring CSIRO ereefs data. 
+:::
+
+# Introduction
+
+This script will analyse several contextual variables in the Offshore Marine Zone of each of the Technical Reports. We will look at:
+
+ - Chlorophyll a,
+ - Secchi,
+ - And possibly Total Suspended Solids or its surrogates
+ 
+"Contextual results" means that these indicators will not be properly scored and graded. Instead the results will be presented as the raw concentration values. Likely presented using statistics such as monthly and annual means, yearly trends, and visual aids (maps, plots).
+
+# Script Set Up
+
+This script requires multiple core spatial packages, each of which is loaded below. Key variables and paths are also created.
+
+```{r}
+#| label: load packages
+remotes::install_github("https://github.com/open-AIMS/gisaimsr")
+remotes::install_github("open-aims/ereefs")
+#use pacman function to load and install (if required) all other packages
+pacman::p_load(tidyverse, glue, here, janitor, sf, tmap, stars, ncmeta, ereefs, ggplot2, RColorBrewer, huxtable, scales)
+
+#load in the custom function used to create the read and write folders for the script
+source(here("functions/script_setup.R"))
+
+#Note, to get params run "ctrl"+"shift"+"p"
+
+#run the function to create the folders and paths
+script_setup()
+
+#set project crs
+proj_crs <- params$project_crs
+
+#set the targeted region
+proj_region <- params$target_region
+
+#set the resolution
+down_sample <- params$resolution
+
+#set the buffer around our target area
+proj_buffer <- params$buffer
+
+source(here("functions/name_cleaning.R"))
+
+```
+
+# Load Data
+
+There are two distinct groups of data used in this analysis, "normal" spatial data, which includes information on each of the Northern Three reporting regions, their marine zones, boundaries, sizes, etc., and the eReefs data. The eReefs data we are referring to in this context as "special" as it is provided in a format not often worked with by data analysts, and requires additional care to utilise.
+
+## Normal Spatial Data
+
+These are the standard datasets used by almost any spatial analysis script in this repository, and the method of obtaining and refining the data should be familiar to those who have worked in this space before. Below we simply extract the spatial information of the areas in which we are going to analyse the data. This will be stored as three sf objects in a list - each object is one of the Northern Three regions. The reason for this method of storage will be apparent further down.
+
+```{r}
+#| label: load the "normal" spatial data
+#| output: FALSE
+
+#get each marine region
+target_marine_region <- n3_region |> 
+    filter(Region == proj_region,
+           Environment == "Marine") |> 
+  group_by(Region, SubBasinOrSubZone) |> 
+  summarise(geometry = st_union(geom)) |> 
+  ungroup() |> 
+  st_cast()
+
+#get a land variation 
+target_land_region <- n3_region |> 
+  filter(Region == proj_region,
+         Environment != "Marine") |> 
+  group_by(Region, SubBasinOrSubZone) |> 
+  summarise(geometry = st_union(geom)) |> 
+  ungroup() |> 
+  st_cast()
+
+#read in reef data and update crs
+reefs <- get(data("gbr_feat", package = "gisaimsr")) |> 
+  name_cleaning() |> 
+  filter(FeatName == "Reef") |> 
+  st_transform(proj_crs)
+ 
+```
+
+## eReefs Data
+
+Now we can look to download the eReefs data. We will be using the spatial information for each of the regions that we loaded above to guide us when extracting the eReefs data.
+
+::: {.callout-note}
+Please note that this script will download the eReefs data from an online server the first time the script is run. This is a lengthy process given the size of the data (several gb) and will take a significant amount of time to process (approximately 20 minutes). To assist in future runs of the script, the data will be saved to your local computer and reloaded next time (approximate 30 seconds).
+:::
+
+Given that this is the 6th script in the series about eReefs data we already have a significant amount of contextual information about the data that makes it a lot easier to understand what data we are downloading and how we can access it. (Not all previous scripts have to be run, but reading them does help). 
+
+Using script 5 we know that to get the data for each year we need to access the following layers:
+
+- 2019-2020 = 1-215 (215 layers total)
+- 2020-2021 = 216-580 (365 layers total)
+- 2021-2022 = 581-945 (365 layers total)
+- 2022-2023 = 946-1310 (365 layers total)
+- 2023-2024 = 1311-1510 (200 layers)
+
+For this script we can focus on downloading just the year of data that is closest to our target data year. I say closest because data is only released roughly every 2 years, thus sometimes the target year matches, sometimes it does not. The general method of downloading is as follows:
+
+1. Set up a table containing the layer counter information determined above and then identify the year we are interested in.
+2. Establish coordinate boundaries of the area of interest
+3. Extract grid cell latitude, longitude information within this area of interest
+4. Compare the coordinate boundaries of the area of interest with the grid cell latitude and longitude (this is because the grid cells are on a curvilinear grid and sometimes extend outside our area of interest due to the line "bending")
+5. From this comparison, extract the true start and end points of the area of interest, accounting for bending
+6. Download each financial year of data individually, using information from steps 4. and 5.
+
+:::{.callout-note}
+Use nc_vars(input_file) to get a table that lists all available variables. It will also tell you the dimensions needed to call the data (usually 3 or 4).
+:::
+
+```{r}
+#| label: load the eReefs data
+
+#create a folder to store all the data outputs
+dir.create(glue("{output_path}/datasets/"))
+
+#-----------------
+#step 1:
+
+#set up our indices reference table
+indicies <- data.frame("Fyear" = c(2020, 2021, 2022, 2023, 2024),
+                       "Start" = c(1, 216, 581, 946, 1311),
+                       "Count" = c(215, 365, 365, 365, 200))
+
+#pick the correct year (the one closest to our target)
+target_indicies <- indicies |>
+  slice(which.min(abs(Fyear - current_fyear)))
+
+#-----------------
+#steps 2 to 6 occur here:
+
+#create a vector of all the variables we want to extract. Note the callout above if you want to get different variables
+indicators_vect <- c("Chl_a_sum", "Secchi", "Turbidity", "DIN")
+
+#get a bounding box of the marine region
+marine_bbox <- st_bbox(st_buffer(target_marine_region, proj_buffer))
+  
+#rearrange to suit how eReefs like to request each point ( order is min lon, max lon, min lat, max lat)
+box_bounds <- c(marine_bbox[1], marine_bbox[3], marine_bbox[2], marine_bbox[4])
+  
+#establish the initial file path using the ereefs package (currently we use the eReefs GBR1 biogeochemistry and sediments v3.2 model)
+#input_file <- substitute_filename("catalog")
+input_file <- "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml"
+    
+#get all grids
+grids <- get_ereefs_grids(input_file)
+    
+#get x and y specifically
+x_grid <- grids[["x_grid"]]
+y_grid <- grids[["y_grid"]]
+  
+#if the value is inside the bounds of each of our coords, change it to TRUE. Those outside are automatically false
+true_false_array <- x_grid >= box_bounds[1] & 
+  x_grid <= box_bounds[2] & 
+  y_grid >= box_bounds[3] & 
+  y_grid <= box_bounds[4]
+  
+#if the value is NA, change it to false.
+true_false_array[is.na(true_false_array)] <- FALSE
+
+#return the row index for every row that contains at least one true value:
+true_rows <- which(apply(true_false_array, 1, any))
+
+#find the first row that contains a true value
+first_row <- true_rows[1]
+
+#find the number of rows that contains a true value
+num_of_rows <- tail(true_rows, n = 1) - first_row
+
+#return the row index for every row that contains at least one true value:
+true_cols <- which(apply(true_false_array, 2, any))
+
+#find the first col that contains a true value
+first_col <- true_cols[1]
+
+#find the number of cols that contains a true value
+num_of_cols <- tail(true_cols, n = 1) - first_col
+  
+#get a vector that states what region we are looking at
+region_lower <- str_replace_all(str_to_lower(unique(target_marine_region$Region)), " ", "_")
+
+for (i in indicators_vect){
+    
+  #create a all lower case versions for reading and writing
+  i_lower <- str_to_lower(i)
+  
+  #check if the file already exists and can be loaded back in
+  if (file.exists(glue('{output_path}/datasets/{i_lower}_{region_lower}.RData'))){
+    
+    #load the data in
+    load(glue('{output_path}/datasets/{i_lower}_{region_lower}.RData'))
+    
+    #if the file does not exists, fetch the data from online then save it
+  } else {
+    
+    #if the indicator is secchi the dimensions of the data are different (no depth)
+    if (i_lower == "secchi"){
+        
+      #extract secchi data using indices to define layer counts
+      assign(glue("{i_lower}_{region_lower}"), 
+             read_ncdf(input_file, var = i, 
+                       ncsub = cbind(start = c(first_row, first_col, target_indicies[1, "Start"]),
+                                     count = c(num_of_rows, num_of_cols, target_indicies[1, "Count"])),
+                       downsample = down_sample))
+      
+    } else {
+        
+      #extract chla data using indices to define layer counts
+      assign(glue("{i_lower}_{region_lower}"), 
+             read_ncdf(input_file, var = i, 
+                       ncsub = cbind(start = c(first_row, first_col,44, target_indicies[1, "Start"]),
+                                     count = c(num_of_rows, num_of_cols, 1, target_indicies[1, "Count"])),
+                       downsample = down_sample))
+    }
+      
+    #save a copy of the data to our output folder
+    save(list = glue("{i_lower}_{region_lower}"), 
+         file = glue('{output_path}/datasets/{i_lower}_{region_lower}.RData'))
+        
+  }
+}
+
+#clean up
+rm(box_bounds, input_file, grids, x_grid, y_grid, outOfBox, xmin, xmax, ymin, ymax, indicies,
+   marine_bbox)
+
+```
+
+### Edit eReefs Data
+
+Once the eReefs data is obtained we need to conduct some basic editing and cleaning steps such as changing out "wrong" values. Once again we are relying on the contextual knowledge built up by the previous scripts in this series to understand that these "wrong" values are the values of grid cells that occur over land (and thus should have no value). Currently these cells have values more than 10,000 times greater than any "real" cell and should be changed to a value of NA.
+
+Additional edits conducted here include updating the names of the data, transforming the CRS of the data, and cropping the data to be more precisely within our target area (the cropping above only cuts the data down to a square box around our area, the cropping that occurs here reduces data to the exact polygon outline of our target area).
+
+```{r}
+#| label: edit the eReefs data p1
+
+#make a cleaner version of the project region variable
+clean_proj_region <- str_replace_all(str_to_lower(proj_region), " ", "_")
+
+data_list <- map(c(glue("chl_a_sum_{clean_proj_region}"), 
+                   glue("secchi_{clean_proj_region}"),
+                   glue("turbidity_{clean_proj_region}"),
+                   glue("din_{clean_proj_region}")),
+                 get)
+
+#run a custom function over the list of lists datasets to crop each correctly
+data_list <- map(data_list, function(dataset){
+  
+  #overwrite erroneous high values (note that a value of even 50 would be very very high)
+  dataset[(dataset > 200)] <- NA
+  
+  #crop to the actual area of interest
+  dataset <- dataset |> 
+   st_transform(proj_crs)# |>
+   #st_crop(target_marine_region)
+  
+})
+
+#update the name of the each data set
+names(data_list) <- c("Chla (ug/L)", "Secchi (m)", "Turbidity (NTU)", "DIN (mg[N]/m^3)")
+
+```
+
+# Data Analysis
+
+For our data analysis section we will be focuses on a few key aspects, these are:
+
+ - Calculating daily mean concentrations and plotting them
+ - Calculating monthly mean concentrations and creating a facet map
+ - Calculating annual values and comparing over time.
+ 
+## Plots
+
+First up are the plots, the main focus of these plots are the daily mean concentration values, however we will also take the time to calculate the annual mean and median and overlay these values on the plot.
+
+Below we extract the data from netcdf format into a sf dataframe to create the plots. Please note that a single day (layer) of data contains upwards of 20,000 cells (i.e. indicator values), that's more than 7 million data points per year per dataset. Thus to save time when conducting this initial exploratory analysis we will take a random sub sample of only 500 cells per day (which is still a few hundred thousand data points) and use that for the dots in the background. We still do use the entire dataset to calculate the daily mean and annual mean and median.
+
+```{r}
+#| label: analyse raw eReefs data p1
+
+#create a folder to store all the outputs
+dir.create(glue("{output_path}/plots/"))
+
+#create a custom function to convert data from nc to sf and take a sub sample if needed
+convert_nc_to_sf <- function(dataset, group, sample_size = NULL){
+  
+  #crop to the actual area of interest
+  dataset <- dataset |> 
+    st_transform(proj_crs) |>
+    st_crop(target_marine_region)
+  
+  #convert raster to a polygon dataset
+  dataset_df <- st_as_sf(dataset, as_points = F, merge = F)
+  
+  #drop the geometry column
+  dataset_df <- st_drop_geometry(dataset_df)
+  
+  #add dates, for some reason they get dropped during the conversion to an sf object
+  target_dates <- date(st_get_dimension_values(dataset, "time"))
+  
+  #assign the dates to the new data
+  colnames(dataset_df) <- target_dates 
+  
+  if (!is.null(sample_size)){#if we want a subset
+    
+    #create a function that picks randomly PER column
+    sampled_data <- map(dataset_df, function(x){
+      
+      #randomly pick n cell per column
+      n_row_indices <- sample(x, sample_size)
+      
+      #return the result
+      return(n_row_indices)
+
+    })
+    
+    #bind this back into a dataframe
+    dataset_df <- as.data.frame(do.call(cbind, sampled_data))
+
+  }
+  
+  #pivot the data longer
+  dataset_df <- dataset_df |> 
+    pivot_longer(cols = everything(), names_to = "Day", values_to = "Values")
+  
+  #make sure the day column is formatted correctly
+  dataset_df$Day <- as.Date(dataset_df$Day)
+  
+  #add a dataset identifier using the second variable in the function
+  dataset_df <- dataset_df |> 
+    mutate(Indicator = group)
+  
+  #remove units from the values column
+  dataset_df <- dataset_df |> 
+    mutate(Values = as.vector(Values))
+  
+  #add a wet/dry column to group data by 
+  dataset_df <- dataset_df |> 
+    mutate(Season = case_when(month(Day) > 4 & month(Day) < 11 ~ "Dry", T ~ "Wet"))
+  
+  #return the df
+  return(dataset_df)
+  
+}
+
+
+#run the custom function that does all of the pre-processing of the data 
+raw_data_df_subset <- map2(data_list, names(data_list), ~convert_nc_to_sf(.x, .y, 500))
+
+#run again, without taking a subset, note this will take much longer
+raw_data_df <- map2(data_list, names(data_list), ~convert_nc_to_sf(.x, .y))
+
+#convert list of df subsets into a single df
+raw_data_df_subset <- bind_rows(raw_data_df_subset)
+  
+#convert list of df into a single df
+raw_data_df <- bind_rows(raw_data_df)
+
+```
+
+Once the data is in the sf format, we can then treat the data like a simple dataframe, something that is a much more familiar format to work with. The list of sf objects is combined into one single dataframe, and then additional information such as if the day was during the wet season or dry season can be added.
+
+::: {.callout-note}
+A question that may occur to you here is "if the sf format is so much easier to work with, why not use it immediately and throughout the script?". The answer to this is one of size and practicality. Although the sf format is more familiar, and thus easier to work with, it does not offer the same efficiency when storing information, or when plotting. As noted above, we down sampled the original data to roughly 1/5 of the size of the original netcdf file and yet the object still takes up more space in our environment. We do also convert the object 1:1, but this is purely to obtain a true annual mean - plotting with this dataset takes much too long. It is simply not practical to convert the objects to the sf format prematurely. Instead, when completing each of our methods further below, we perform as much of the analysis as we can using the native netcdf format. Often these steps include calculating monthly, annual, or spatial means - which naturally reduce the size of the data to a point at which it is then feasible to convert the data to the sf format.
+:::
+
+We will then convert data for three of the four indicators onto a log scale. Although the data has not be analysed statistically to "prove" this is a better distribution, a visual assessment of each indicators distribution of values was conducted to come to this conclusion. Histograms of values before and after are presented below.
+
+Before:
+
+```{r}
+#| label: create histograms of data 1
+#| output: TRUE
+
+#create the histogram of the normal values
+p_before <- ggplot(raw_data_df) +
+  geom_histogram(aes(x = Values, fill = Indicator), bins = 150) +
+  facet_wrap(~Indicator,
+             scales = "free")
+
+p_before
+
+```
+
+After:
+
+```{r}
+#| label: create histograms of data 2
+#| output: TRUE
+
+#convert values for three of four indicators to a log scale
+raw_data_df_log <- raw_data_df |> 
+  group_by() |> 
+  mutate(Values = case_when(str_detect(Indicator, "Secchi") ~ Values,
+                            T ~ log(Values))) |> 
+  ungroup()
+
+#shift all values back to zero by adding the min value per indicator
+raw_data_df_log <- raw_data_df_log |> 
+  group_by(Indicator) |> 
+  mutate(Values = Values - min(Values)) |> 
+  ungroup()
+
+#create the histogram of the logged values
+p_after <- ggplot(raw_data_df_log) +
+  geom_histogram(aes(x = Values, fill = Indicator), bins = 150) +
+  facet_wrap(~Indicator,
+             scales = "free")
+
+p_after
+
+```
+
+Its not perfect, but it certainly helps.
+
+```{r}
+#| label: finalise the log transformation
+
+#rename the main dataset to be have the log values
+raw_data_df <- raw_data_df_log
+
+#repeat the log transformation for our subset of data
+raw_data_df_subset <- raw_data_df_subset |> 
+  group_by() |> 
+  mutate(Values = case_when(str_detect(Indicator, "Secchi") ~ Values,
+                            T ~ log(Values))) |> 
+  ungroup()
+
+#shift all values back to zero by adding the min value per indicator
+raw_data_df_subset <- raw_data_df_subset |> 
+  group_by(Indicator) |> 
+  mutate(Values = Values - min(Values)) |> 
+  ungroup()
+
+```
+
+Once the additional modifications have been made to the data, it can be plotted:
+
+```{r}
+#| label: plot raw eReefs data p1
+#| output: TRUE
+
+#calculate group mean to use for the yintercept line from the full dataset
+group_means <- raw_data_df |>
+  group_by(Indicator) |> 
+  summarise(MeanValue = mean(Values, na.rm = T)) |> 
+  ungroup()
+    
+#calculate group median to use for the yintercept line from the full dataset
+group_medians <- raw_data_df |>  
+  group_by(Indicator) |> 
+  summarise(MedianValue = median(Values, na.rm = T)) |> 
+  ungroup()
+    
+#summarise data by month from the full dataset
+raw_data_df <- raw_data_df |> 
+  mutate(Month = month(Day))
+    
+#create the plot, this contains a point plot, a smoothed line plot, and a volin plot
+summary_plot <- ggplot() +
+  geom_point(data = raw_data_df_subset,
+             aes(x = Day, y = Values, color = Season, group = Indicator), 
+             size = 0.1) +
+  geom_smooth(data = raw_data_df_subset,
+              aes(x = Day, y = Values, group = Indicator), 
+              method = "gam", 
+              formula = y ~ s(x), 
+              color = "blue", 
+              se = F) +
+  geom_violin(data = raw_data_df_subset,
+              aes(x = Day, y = Values, group = Indicator), 
+              alpha = 0.5, 
+              color = "Black") +
+  geom_hline(data = group_means, 
+             aes(yintercept = MeanValue, group = Indicator), 
+             color = "purple") +
+  geom_hline(data = group_medians, 
+             aes(yintercept = MedianValue, group = Indicator), 
+             color = "green") +
+  scale_x_date(breaks = pretty_breaks(6)) +
+  labs(x = "Date", y = "Concentration") +
+  theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          legend.position = "none") +
+    facet_wrap(~Indicator, nrow = 1, 
+               scales = "free")
+  
+#save the individual plots
+ggsave(glue("{output_path}/plots/{region_lower}_all_indicators_plot.png"), summary_plot, width = 15, height = 5)
+
+```
+
+## Maps
+
+With the plots completed we can move on to creating the monthly mean maps for each of the indicators. First we need to calculate monthly means for each indicator, then stitch the layer back into groups:
+
+```{r}
+#| label: map eReefs data p1
+
+#write a custom function that does each of the required steps to calculate the monthly values
+monthly_mean_data <- map(data_list, function(dataset){
+  
+  #get the list of "times" (dates) stored in the dataset (1 date per layer) and convert it into a dataframe
+  dates <- data.frame(DateTime = st_get_dimension_values(dataset, which = "time"))
+  
+  #extract the year and month and combine into a single unique name and add an index column
+  dates <- dates |> 
+    mutate(Year = year(DateTime),
+           Month = month(DateTime, label = T),
+           RowId = row_number()) |> 
+    unite(LayerName, "Year", "Month", sep = "_")
+  
+  #group by LayerName and get the min and max row index (layer number) for each month, then reorder the dataframe by index
+  dates <- dates |> 
+    group_by(LayerName) |> 
+    summarise(MinIndex = min(RowId),
+              MaxIndex = max(RowId)) |> 
+    arrange(MinIndex)
+  
+  #create a trackers for the objects that will be made
+  created_objects <- c()
+  
+  #loop over each of the unique names
+  for (i in unique(dates$LayerName)){
+  
+    #get the index numbers for the min and max layers from the table
+    min_layer <- dates |> filter(LayerName == i) |> select(MinIndex) |> as.numeric()
+    max_layer <- dates |> filter(LayerName == i) |> select(MaxIndex) |> as.numeric()
+    
+    #extract the month of data using the index numbers 
+    if (str_detect(names(dataset), "Secchi")){# if secchi: [attribute, i (lat), j (long), time] - no depth
+      
+      monthly_mean <- dataset[,,,min_layer:max_layer]
+    
+    } else {#otherwise [attribute, i (lat), j (long), k (depth), time]
+      
+      monthly_mean <- dataset[,,,,min_layer:max_layer]
+    }
+    
+    #and apply the mean function over the i,j dimensions (lat, long)
+    monthly_mean <- st_apply(monthly_mean, 1:2, FUN = mean, keep = TRUE)
+    
+    #assign the monthly_mean dataset to a new object
+    assign(glue("{i}"), monthly_mean)
+    
+    #create a vector that tracks all the names of the created objects
+    created_objects <- c(created_objects, glue("{i}"))
+  
+  }
+  
+  #combine each of the monthly layers into one new dataset ("mget" is "multiple get") and this will be the output of the function
+  dataset <- do.call(c, mget(created_objects))
+  
+})
+
+```
+
+Then we convert these stacks of monthly means into sf objects:
+
+```{r}
+#| label: map eReefs data p2
+
+monthly_mean_df <- map(monthly_mean_data, function(dataset){
+  
+  #extract the datasets into tables
+  dataset_df <- st_as_sf(dataset, as_points = F, merge = F)
+  
+  #pivot the tables longer to make them easier to work with, split the layer information into Financial Year and month, and order by Month
+  dataset_df <- dataset_df |> 
+    pivot_longer(cols = matches("\\d"), names_to = "Layer", values_to = "Value") |> 
+    separate(Layer, into = c("FinancialYear", "Month"), sep = "_", remove = F) |> 
+    mutate(Month = as.factor(Month),
+           Month = fct_relevel(Month, "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", 
+                               "Mar", "Apr", "May", "Jun"))
+  
+  #return the object
+  return(dataset_df)
+  
+})
+
+
+```
+
+Next we set up the arguments that are going to vary for each map and each region.
+
+```{r}
+#| label: map eReefs data p3
+
+#create a list of palettes to switch between for each indicator
+indicator_palettes <- c("brewer.greens", "-brewer.oranges", "-carto.ag_sunset", "brewer.blues")
+
+#create a function that use either the linear or the log scale
+args_per_indicator <- function(x){
+
+  if (str_detect(names(monthly_mean_df)[[x]], "Secchi")){#if indicator is secchi use a linear scale
+    
+    tm_scale_continuous(values = indicator_palettes[x],
+                         n = 6)
+    
+  } else {#otherwise, use a log scale
+  
+    tm_scale_continuous_log10(values = indicator_palettes[x],
+                         n = 6)
+    
+  }
+  
+}
+
+#create an function that produces the correct title
+map_name <- function(i){
+  
+  #get the name of the indicator currently being run
+  ind_name <- names(data_list)[i]
+  
+  #replace the space with a new line
+  ind_name <- str_replace(ind_name, " ", "\n")
+  
+  #if the indicator is not secchi, add the note that it is a log scale 
+  ind_name <- if(!str_detect(ind_name, "Secchi")){glue("{ind_name} (log)")} else {ind_name}
+  
+}
+
+```
+
+Facet maps of the monthly values can then be made:
+
+```{r}
+#| label: map eReefs data p4
+#| output: TRUE
+
+#mask reefs to the region we are currently looking at
+target_reefs <- st_intersection(reefs, st_union(target_marine_region))
+
+#for each sf dataframe in our list
+for (i in 1:length(monthly_mean_df)){
+  
+  #create the map
+  map <- tm_shape(qld) +
+    tm_polygons(fill = "#99B5B1",
+                col = "#7bba9d") +
+    tm_shape(target_land_region) +
+    tm_polygons(fill = "grey90", 
+                col = "black") +
+    tm_shape(monthly_mean_df[[i]]) +
+    tm_polygons(fill = "Value", 
+                fill.scale = args_per_indicator(i),
+                fill.legend = tm_legend(reverse = TRUE,
+                                        title = map_name(i), #run our custom function from above
+                                        na.show = FALSE), 
+                col_alpha = 0) +
+    tm_facets(by = "Month", 
+              ncol = if(proj_region == "Wet Tropics"){6}else{4}) +
+    tm_shape(reefs) +
+    tm_borders(fill = "grey60",
+               fill_alpha = 0.2,
+               col = "grey60",
+               col_alpha = 0.4) +
+    tm_shape(target_reefs) +
+    tm_borders(fill = "grey60",
+               fill_alpha = 0.2,
+               col = "black",
+               col_alpha = 0.5) +
+    tm_shape(target_marine_region) +
+    tm_borders(col = "black") +
+    tm_shape(st_buffer(target_marine_region, 0.5), is.main = T) +
+    tm_borders(col = NULL,
+               fill = NULL) +
+    tm_layout(bg.color = "#C1DEEA",
+              legend.position = tm_pos_out("right", "center"))
+  
+  #extract a clean name for saving
+  indicator_name <- str_extract(names(data_list)[i], "^[^ ]+")
+  
+  #and save
+  tmap_save(map, glue("{output_path}/plots/{region_lower}_{indicator_name}_map.png"))
+  
+}
+
+```
+
+## Tables
+
+Finally, we will create a table summarizing the key statistics we have found throughout this analysis. These tables will contain:
+
+ - monthly mean values
+ - annual mean values
+
+```{r}
+#| label: create summary table
+#| output: TRUE
+
+#create a folder to store all the data outputs
+dir.create(glue("{output_path}/tables/"))
+
+#read in the custom function to style tables
+source(here("functions/cond_form_tables.R"))
+
+#extract monthly and annual means
+summary_table <- raw_data_df |> 
+  group_by(Indicator) |> 
+  mutate(AnnualMeanValue = mean(Values, na.rm = T)) |> 
+  group_by(Indicator, Month, AnnualMeanValue) |> 
+  summarise(MonthlyMeanValue = mean(Values, na.rm = T)) |> 
+  ungroup() |> 
+  mutate(Month = month(Month, label = T),
+         Month = fct_relevel(Month, "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun")) |> 
+  arrange(Month)
+
+#pivot data wider into a reader friendly format
+summary_table_wide <- summary_table |> 
+  pivot_wider(names_from = Month, values_from = MonthlyMeanValue) |> 
+  relocate("AnnualMeanValue", .after = last_col()) |> 
+  mutate(across(where(is.numeric), ~round(.x, 2)))
+
+#save the table
+write_csv(summary_table_wide, glue("{output_path}/tables/{region_lower}_summary_table.csv"))
+
+#print the table in a visually appealing way
+cond_form_tables(summary_table_wide, header_rows = 1, landscape = F, score_colour = F) |> 
+  set_align(everywhere, everywhere, "center") |> 
+  set_valign(everywhere, everywhere, "middle")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

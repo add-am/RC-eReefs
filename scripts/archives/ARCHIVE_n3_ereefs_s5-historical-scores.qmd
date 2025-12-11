@@ -1,0 +1,1560 @@
+---
+title: "An Analysis of Historical Chlorophyll a Scores in the Offshore Marine Zone Using eReefs"
+subtitle: "A Healthy Waters Partnership Analysis"
+description: "This script analyses and presents historical chlorophyll a scores in the offshore marine zone of the northern three regions using data provided by the eReefs modelling suite."
+author: "Adam Shand" 
+format: html
+params:
+  project_crs: "EPSG:7844"
+  target_fyear: 2024
+---
+
+::: {.callout-note}
+This is one part of several scripts exploring CSIRO ereefs data. 
+:::
+
+# Introduction
+
+This script will analyse chlorophyll a scores for several years of report cards. The objective of this historical analysis is to determine if there is measurable variation in the scores between years, as well as if there is variation spatially. A secondary benefit of these scores is that they will allow us to cross check scores against large scale historical events (such as the 2019 floods) to determine the validity of using eReefs data.
+
+We will explore three main methods of scoring the data in an attempt to identify the most appropriate method for use in the Northern Three Report Cards. Each of these methods are explained in detail further below.
+
+# Script Set Up
+
+This script requires multiple core spatial packages, each of which is loaded below. Key variables and paths are also created.
+
+```{r}
+#| label: load packages
+
+#use pacman function to load and install (if required) all other packages
+pacman::p_load(tidyverse, glue, here, janitor, sf, tmap, stars, ncmeta, ereefs, ggplot2, RColorBrewer, huxtable)
+
+#load in the custom function used to create the read and write folders for the script
+source(here("functions/script_setup.R"))
+
+#run the function to create the folders and paths
+script_setup()
+
+#set project crs
+proj_crs <- params$project_crs
+
+source(here("functions/name_cleaning.R"))
+
+```
+
+# Load Data
+
+There are two distinct groups of data used in this analysis, "normal" spatial data, which includes information on each of the Northern Three reporting regions, their marine zones, boundaries, sizes, etc., and the eReefs data. The eReefs data we are referring to in this context as "special" as it is provided in a format not often worked with by data analysts, and requires additional care to utilise.
+
+## Normal Spatial Data
+
+These are the standard datasets used by almost any spatial analysis script in this repository, and the method of obtaining and refining the data should be familiar to those who have worked in this space before. Below we simply extract the spatial information of the areas in which we are going to analyse the data, currently we are testing this workflow exclusively for the Dry Tropics Region.
+
+```{r}
+#| label: load the "normal" spatial data
+#| output: FALSE
+
+#get a marine variation of the northern three dataset (to help get eReefs data)
+n3_marine_region <- n3_region |> 
+  filter(Environment == "Marine") |> 
+  group_by(SubBasinOrSubZone) |> summarise(geometry = st_union(geom)) |> 
+  ungroup() |> st_cast()
+
+#get a land variation of the northern three dataset (mostly for visuals in the maps)
+n3_land_region <- n3_region |> 
+  filter(Environment != "Marine") |> 
+  group_by(SubBasinOrSubZone) |> summarise(geometry = st_union(geom)) |> 
+  ungroup() |> st_cast()
+
+#get a marine variation of the dry tropics region (smaller test area)
+dt_marine_region <- n3_region |> 
+  filter(Region == "Dry Tropics",
+         Environment == "Marine") |> 
+  group_by(BasinOrZone, SubBasinOrSubZone) |> summarise(geometry = st_union(geom)) |> 
+  ungroup() |> st_cast()
+
+#get a land variation of the dry tropics region (mostly for visuals in the maps)
+dt_land_region <- n3_region |> 
+  filter(Region == "Dry Tropics",
+         Environment != "Marine") |> 
+  group_by(SubBasinOrSubZone) |> summarise(geometry = st_union(geom)) |> 
+  ungroup() |> st_cast()
+
+```
+
+## eReefs Data
+
+Now we can look to download the eReefs data. We will be using the spatial information for the Dry Tropics Region that we loaded above to guide us when extracting the eReefs data.
+
+::: {.callout-note}
+Please note that this script will download the eReefs data from an online server the first time the script is run. This is a lengthy process given the size of the data (several gb) and will take a significant amount of time to process (approximately 20 minutes). To assist in future runs of the script, the data will be saved to your local computer and reloaded next time (approximate 30 seconds).
+:::
+
+Given that this is the 5th script in the series about eReefs data we already have a significant amount of contextual information about the data that makes it alot easier to understand what data we are downloading and how we can access it. For example, the data available starts at 2019-10-16 and runs until 2024-01-16 (a total of 1510 days of data). Although we could download every layer into one nc file, this results in what is called a "proxy object". Proxy objects are not directly opened with the R environment and can be difficult to work with. Instead we will use our contextual knowledge of the eReefs data to access the data in chunks by financial year which will make it easier to conduct further analysis. To do this we need a firm understanding of the layer counter. Above, I said that we know the date range of the data (2019-10-16 to 2024-01-16), and we also know exactly how many layers of data there are (1510 days). We can this infer that layer 1 = 2019-10-16 and layer 1510 = 2024-01-16. It would then be possible, with a bit of counting and comparing the start and end date ranges we have, to find the boundaries of each financial year:
+
+- The 2019-2020 financial year is not completed, but should have 258 days of data (layer 1 to layer 258)
+- 2020-2021 is a full year and should have 365 days of data (layer 259 to layer 624)
+- 2021-2022 is a full year and should have 365 days of data (layer 625 to layer 991)
+- 2022-2023 is a full year and should have 365 days of data (layer 992 to layer 1,358)
+- The 2023-2024 financial year is also not completed but should have 200 days of data (layer 1,359 to 1,559)
+
+However, just by doing this we can see that things are not quite lining up as it says that we should have 1559 layers when we know the dataset only contains 1510 layers of data. We can conclude there are likely a few days of data that are missing in the model, maybe due to quality issues, however we can't be sure why. Conducting further inspections of the raw dataset and metadata (not presented in this script) allowed us to identify that the correct indexation for each of the financial years is as follows:
+
+- 2019-2020 = 1-215 (215 layers total)
+- 2020-2021 = 216-580 (365 layers total)
+- 2021-2022 = 581-945 (365 layers total)
+- 2022-2023 = 946-1310 (365 layers total)
+- 2023-2024 = 1311-1510 (200 layers)
+
+With that out of the way, we can finally start looking at downloading the data! The general method of downloading is as follows:
+
+1. Establish coordinate boundaries of the area of interest
+2. Extract grid cell latitude, longitude information within this area of interest
+3. Compare the coordinate boundaries of the area of interest with the grid cell latitude and longitude (this is because the grid cells are on a curvilinear grid and sometimes extend outside our area of interest due to the line "bending")
+4. From this comparison, extract the true start and end points of the area of interest, accounting for bending
+5. Set up a table containing the layer counter information determined above
+6. Download each financial year of data individually, using information from steps 4. and 5.
+
+Steps 1 to 5 occur here:
+
+```{r}
+#| label: load the eReefs data p1
+
+#get a bounding box of the marine region
+dt_marine_bbox <- st_bbox(dt_marine_region)
+
+#rearrange to suit how eReefs like to request each point ( order is min lon, max lon, min lat, max lat)
+box_bounds <- c(dt_marine_bbox[1], dt_marine_bbox[3], dt_marine_bbox[2], dt_marine_bbox[4])
+
+#establish the initial file path using the ereefs package (currently we use the eReefs GBR1 biogeochemistry and sediments v3.2 model)
+#input_file <- substitute_filename("catalog")
+input_file <- "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml"
+  
+#get all grids
+grids <- get_ereefs_grids(input_file)
+  
+#get x and y specifically
+x_grid <- grids[["x_grid"]]
+y_grid <- grids[["y_grid"]]
+  
+#create an array of FALSE values the same dimensions as the x (and y) grids
+outOfBox <- array(FALSE, dim = dim(x_grid))
+  
+#change array value to TRUE if the associated value in the x or y grid at the same position is outside our bounding box
+if (!is.na(box_bounds[1])) {outOfBox <- apply(x_grid, 2, function(x) {(x < box_bounds[1] | is.na(x))})}
+if (!is.na(box_bounds[2])) {outOfBox <- outOfBox | apply(x_grid, 2, function(x) {(x > box_bounds[2] | is.na(x))})}
+if (!is.na(box_bounds[3])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x < box_bounds[3] | is.na(x))})}
+if (!is.na(box_bounds[4])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x > box_bounds[4] | is.na(x))})}
+  
+#find the first x position (row) that is inside the bounding box (i.e. the first row with at least one TRUE val)
+xmin <- which(apply(!outOfBox, 1, any))[1]
+  
+#find all (rows) inside the bounding box (i.e. all rows with at least one TRUE val) then take the last using length() as the index
+xmax <- which(apply(!outOfBox, 1, any))
+xmax <- xmax[length(xmax)]
+  
+#find the first y position (col) that is inside the bounding box (i.e. the first col with at least one TRUE val)
+ymin <- which(apply(!outOfBox, 2, any))[1]
+  
+#find all (cols) inside the bounding box (i.e. all cols with at least one TRUE val) then take the last using length() as the index
+ymax <- which(apply(!outOfBox, 2, any))
+ymax <- ymax[length(ymax)]
+
+#set up our indices
+indicies <- data.frame("Fyear" = c("19_20", "20_21", "21_22", "22_23", "23_24"),
+                       "Start" = c(1, 216, 581, 946, 1311),
+                       "Count" = c(215, 365, 365, 365, 200))
+
+```
+
+While step 6 occurs here:
+
+```{r}
+#| label: load the eReefs data p2
+
+#loop over each of the datasets (defined by each row of indices data)
+for (i in 1:nrow(indicies)){
+
+  #check if the file already exists and can be loaded back in
+  if (file.exists(glue('{output_path}/chla_{indicies[i, "Fyear"]}.RData'))){
+    
+    #if the file exists, load it in
+    load(glue('{output_path}/chla_{indicies[i, "Fyear"]}.RData'))
+    
+    #rename the file (for some reason it loads in with the name nc_chla??)
+    assign(glue('chla_{indicies[i, "Fyear"]}'), nc_chla)
+    
+    #if the file does not exists, fetch the data from online then save it
+  } else {
+    
+    #extract chla data using indices to define layer counts
+    nc_chla <- read_ncdf(input_file, var = "Chl_a_sum", 
+                         ncsub = cbind(start = c(xmin, ymin, 44, indicies[i, "Start"]),
+                                       count = c((xmax - xmin), (ymax - ymin), 1, indicies[i, "Count"])))
+  
+    #assign the data to an appropriately named object
+    assign(glue('chla_{indicies[i, "Fyear"]}'), nc_chla)
+    
+    #save a copy of the data to our output folder
+    save(nc_chla, file = glue('{output_path}/chla_{indicies[i, "Fyear"]}.RData'))
+    
+  }
+}
+
+#clean up
+rm(box_bounds, input_file, grids, x_grid, y_grid, outOfBox, xmin, xmax, ymin, ymax, indicies,
+   dt_marine_bbox, nc_chla)
+
+```
+
+### Edit eReefs Data
+
+Once the eReefs data is obtained we need to conduct some basic editing and cleaning steps such as changing out "wrong" chlorophyll a values. Once again we are relying on the contextual knowledge built up by the previous scripts in this series to understand that these "wrong" values are the values of grid cells that occur over land (and thus should have no chla value). Currently these cells have values more than 10,000 times greater than any "real" cell and should be changed to a value of NA.
+
+Additional edits conducted here include updating the names of the data, transforming the CRS of the data, and cropping the data to be more precisely within our target area (the cropping above only cuts the data down to a square box around our area, the cropping that occurs here reduces data to the exact polygon outline of our target area).
+
+At this stage we can also combine the five financial years of data into a single list object. This will make further processing significantly easier and more legible.
+
+```{r}
+#| label: edit the eReefs data p1
+
+#create a list of the datasets we want to run through
+data_list <- list(chla_19_20, chla_20_21, chla_21_22, chla_22_23, chla_23_24)
+
+#run a custom function over the list of datasets
+data_list <- map(data_list, function(dataset){
+  
+  #overwrite erroneous high values (note that a value of even 50ug/L would be WILDLY high)
+  dataset[(dataset > 200)] <- NA
+  
+  #update the name of the layer for the legend in the map
+  names(dataset) <- "Chla ug/L"
+  
+  #update crs, and crop to the actual area of interest
+  dataset <- dataset |> 
+    st_transform(proj_crs) |> 
+    st_crop(dt_marine_region)
+  
+})
+
+#effectively we now have each of the stars datasets stored in this one list, so we can remove the individual datasets now
+rm(chla_19_20, chla_20_21, chla_21_22, chla_22_23, chla_23_24)
+
+```
+
+Once these basic edits have been done we can move onto slightly more complicated edits.
+
+A key consideration of using the eReefs data is that it will only be used in the Offshore Marine Zone for each of the Northern Three Regions. However, if you have been reading the code closely you may have noticed that the data currently expands across the entire Dry Tropics Marine Zone (Inshore and Offshore). Thus we now need to perform additional spatial separation of the data, although we don't just want to eliminate the inshore zone because we are still interested in seeing how the data looks in that area.
+
+The logic behind the spatial separation of the data is fairly standard, using the Dry Tropics region's marine zones to cut out different sections of the data. However, it should be noted that in this case we will be combining the "Enclosed Coastal" and "Open Coastal" marine zones into the one "Coastal" marine zone due to the very limited size of the enclosed coastal zone alot of the time. Below we break the data up into marine zone, and thus should have 5 years of data (19-20, 20-21, 21-22, 22-23, 23-24) across 3 zones (Enclosed+Open Coastal, Midshelf, Offshore) for a total of 15 different datasets that we want to work with.
+
+```{r}
+#| label: edit the eReefs data p2
+
+#create the three marine zones that we will use to cut out the datasets
+coastal <- dt_marine_region |> filter(str_detect(SubBasinOrSubZone, "Coastal"))
+midshelf <- dt_marine_region |> filter(str_detect(SubBasinOrSubZone, "Midshelf"))
+offshore <- dt_marine_region |> filter(str_detect(SubBasinOrSubZone, "Offshore"))
+
+#combine the three marine zones into a single list
+zone_list <- list(coastal, midshelf, offshore)
+
+#run a custom function over the list of our five datasets
+data_by_zone <- map(data_list, function(data_item){
+  
+  #run a custom function over the list of three marine zones
+  map(zone_list, function(zone){
+    
+    #the actually "custom function" is just st_crop() lol
+    st_crop(data_item, zone)
+  
+  })
+})
+
+#this creates a list for each of the years, (thus 5 sets of 3) we need to flatten this to a single list of 15
+data_by_zone <- flatten(data_by_zone)
+
+#clean up and save space in the global environment
+rm(coastal, midshelf, offshore, data_list, zone_list)
+
+```
+
+# Data Analysis
+
+All of the eReefs datasets have now been downloaded and edited appropriately. At this point we should have a total of 15 dataset:
+
+|Year      |Coastal       |Midshelf       |Offshore       |
+|:---      |:---          |:---           |:---           |
+|2019-2020 |coastal_19_20 |midshelf_19_20 |offshore_19_20 | 
+|2020-2021 |coastal_20_21 |midshelf_20_21 |offshore_20_21 |
+|2021-2022 |coastal_21_22 |midshelf_21_22 |offshore_21_22 |
+|2022-2023 |coastal_22_23 |midshelf_22_23 |offshore_22_23 |
+|2023-2024 |coastal_23_24 |midshelf_23_24 |offshore_23_24 |
+
+All of which we can now begin to interrogate and analyse. 
+
+## Raw Data Analysis
+
+Before diving directly into an exploration of the methods of scoring eReefs data, it is a good idea to first conduct some analysis of the raw data. The aim of this preliminary exploration is to provide a greater understanding of the raw values underlying the scores we will eventually calculate.
+
+Below we extract the data from netcdf format into a sf dataframe, and create plots of the daily data. Please note that a single day (layer) of data contains upwards of 20,000 cells (i.e. Chla values), that's more than 7 million data points per year per dataset. Thus to save time when conducting this initial exploratory analysis we will take a random sub sample of only 500 cells (Chla values) per day (which is still a few hundred thousand data points).
+
+```{r}
+#| label: analyse raw eReefs data p1
+
+#create a list of the names that we want to give to the data in our list of datasets
+name_list <- list("coastal_19_20", "midshelf_19_20", "offshore_19_20", 
+                  "coastal_20_21", "midshelf_20_21", "offshore_20_21", 
+                  "coastal_21_22", "midshelf_21_22", "offshore_21_22", 
+                  "coastal_22_23", "midshelf_22_23", "offshore_22_23", 
+                  "coastal_23_24", "midshelf_23_24", "offshore_23_24")
+
+#run the custom function that does all of the pre-processing of the data 
+raw_data_df <- map2(data_by_zone, name_list, function(dataset, group){
+
+  #convert raster to a polygon dataset
+  dataset_df <- st_as_sf(dataset, as_points = F, merge = F)
+  
+  #drop the geometry column
+  dataset_df <- st_drop_geometry(dataset_df)
+  
+  #add dates, for some reason they get dropped during the conversion to an sf object
+  target_dates <- date(st_get_dimension_values(dataset, "time"))
+  
+  #assign the dates to the new data
+  colnames(dataset_df) <- target_dates 
+  
+  #take a random sample of the dataset (only 500 data points per day rather than >25,000)
+  dataset_df <- dataset_df |> 
+    slice_sample(n = 500)
+  
+  #pivot the data longer
+  dataset_df <- dataset_df |> 
+    pivot_longer(cols = everything(), names_to = "Day", values_to = "Values")
+  
+  #add a dataset identifier using the second variable in the function
+  dataset_df <- dataset_df |> 
+    mutate(GroupIdentifier = group)
+  
+  #return the df
+  return(dataset_df)
+
+})
+
+```
+
+Once the data is in the sf format, we can then treat the data like a simple dataframe, something that is a much more familiar format to work with. The list of sf objects is combined into one single dataframe, and then additional information such as if the day was during the wet season or dry season can be added.
+
+::: {.callout-note}
+A question that may occur to you here is "if the sf format is so much easier to work with, why not use it immediately and throughout the script?". The answer to this is one of size and practicality. Although the sf format is more familiar, and thus easier to work with, it does not offer the same efficiency when storing information. As noted above, we down sampled the original data to roughly 1/5 of the size of the original netcdf file and yet the object still takes up more space in our environment. It is simply not practical to convert the objects to the sf format prematurely. Instead, when completing each of our methods further below, we perform as much of the analysis as we can using the native netcdf format. Often these steps include calculating monthly, annual, or spatial means - which naturally reduce the size of the data to a point at which it is then feasible to convert the data to the sf format.
+:::
+
+```{r}
+#| label: analyse raw eReefs data p2
+
+#combine the list of datasets together into one dataset
+raw_data_df <- bind_rows(raw_data_df)
+
+#add a wet/dry column to group data by
+raw_data_df <- raw_data_df |> 
+  mutate(Season = case_when(month(Day) > 4 & month(Day) < 11 ~ "Dry", T ~ "Wet"))
+
+#add a column that only focuses on zone, and a column that only focuses on year (helps for looping when making the plots)
+raw_data_df <- raw_data_df |> 
+  separate(GroupIdentifier, into = c("MarineZone", "FinancialYear"), sep = "_", remove = F, extra = "merge")
+
+```
+
+Once the additional modifications have been made to the data, it can be plotted:
+
+```{r}
+#| label: plot raw eReefs data
+
+#split the data by marine zone and loop to create three distinct maps
+for (i in unique(raw_data_df$MarineZone)){
+  
+  #grab the subset of data
+  data_subset <- raw_data_df |> 
+    filter(MarineZone == i)
+  
+  #calculate group mean to use for the yintercept line
+  group_means <- data_subset |> 
+    group_by(FinancialYear) |> 
+    summarise(MeanValue = mean(Values, na.rm = T))
+  
+  #calculate group median to use for the yintercept line
+  group_medians <- data_subset |> 
+    group_by(FinancialYear) |> 
+    summarise(MedianValue = median(Values, na.rm = T))
+  
+  #create the plot, this contains a point plot, a smoothed line plot, and a volin plot
+  summary_plot <- ggplot(data_subset) +
+    geom_point(aes(x = Day, y = Values, color = Season, group = FinancialYear), size = 0.1) +
+    geom_smooth(aes(x = Day, y = Values, group = FinancialYear), method = "gam", formula = y ~ s(x), color = "blue", se = F) +
+    geom_violin(aes(x = Day, y = Values, group = FinancialYear), alpha = 0.5, color = "Black") +
+    geom_hline(yintercept = 0.4, color = "black", linetype = "dashed") +
+    geom_hline(data = group_means, aes(yintercept = MeanValue, group = FinancialYear), color = "purple") +
+    geom_hline(data = group_medians, aes(yintercept = MedianValue, group = FinancialYear), color = "green") +
+    scale_y_log10() +
+    labs(x = "Financial Year", y = "Chlorophyll a (ug/L)") +
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.x = element_blank()) +
+    facet_wrap(~FinancialYear, scales = "free_x", nrow = 1)
+  
+  #save the plot
+  ggsave(glue("{output_path}/{i}_plot.png"), width = 15, height = 5)
+  
+}
+
+```
+
+And mapped: (noting that since these maps are just about providing a spatial frame of reference, a single random day has been mapped - rather than any particular calculation or point in time).
+
+```{r}
+#| label: map raw eReefs data
+
+#grab a subset of our data
+data_zone_subset <- data_by_zone[1:3]
+
+#and then three dates and smash them together
+data_zone_subset <- list(data_zone_subset[[1]][,,,,1], data_zone_subset[[2]][,,,,1], data_zone_subset[[3]][,,,,1])
+
+#create a list of names to loop over
+names_to_use <- c("coastal", "midshelf", "offshore")
+
+#for each sf dataframe in our list
+for (i in 1:length(data_zone_subset)){
+  
+  #create the map
+  zone_map <- tm_shape(qld) +
+    tm_polygons(fill = "grey80") +
+    tm_shape(dt_land_region) +
+    tm_polygons(fill = "grey90", 
+                col = "black") +
+    tm_shape(data_zone_subset[[i]]) +
+    tm_raster(col.scale = tm_scale_continuous(values = "brewer.greens"),
+              col.legend = tm_legend(reverse = T)) +
+    tm_shape(dt_marine_region, is.main = T) +
+    tm_borders(col = "black") +
+    tm_layout(legend.bg.color = "white", 
+              legend.frame = "black", 
+              legend.position = c("right", "bottom"),
+              asp = 1.1)
+
+  #and save
+  tmap_save(zone_map, glue("{output_path}/{names_to_use[i]}_map.png"))
+  
+}
+
+```
+
+Each of these sets of plots and maps can then be viewed below:
+
+The Coastal Zone
+
+```{r}
+#| label: show coastal eReefs raw data map
+#| output: true
+#| fig-cap: A map of a single day of Chlorophyll a data in the Coastal Marine Zone.
+
+knitr::include_graphics(glue("{output_path}/coastal_map.png"), error = F, rel_path = F)
+
+```
+
+```{r}
+#| label: show coastal eReefs raw data plot
+#| output: true
+#| fig-cap: A plot of daily eReefs Chlorophyll a data in the Coastal Marine Zone. Red dots are values recorded during the dry season (May to October), and teal dots are values recorded during the wet season (November - April). The black dashed line represents the WQO value of 0.4ug/L, the purple solid line is the mean Chlorophyll a value for the financial year, the green solid line is the median value, and the blue line is the daily mean Chlorophyll a value. A violin plot has been overlaid that demonstrates the spread of the entire dataset.
+
+knitr::include_graphics(glue("{output_path}/coastal_plot.png"), error = F, rel_path = F)
+
+```
+
+The Midshelf Zone
+
+```{r}
+#| label: show midshelf eReefs raw data map
+#| output: true
+#| fig-cap: A map of a single day of Chlorophyll a data in the Midshelf Marine Zone.
+
+knitr::include_graphics(glue("{output_path}/midshelf_map.png"), error = F, rel_path = F)
+
+```
+
+```{r}
+#| label: show midshelf eReefs raw data plot
+#| output: true
+#| fig-cap: A plot of daily eReefs Chlorophyll a data in the Midshelf Marine Zone. Red dots are values recorded during the dry season (May to October), and teal dots are values recorded during the wet season (November - April). The black dashed line represents the WQO value of 0.4ug/L, the purple solid line is the mean Chlorophyll a value for the financial year, the green solid line is the median value, and the blue line is the daily mean Chlorophyll a value. A violin plot has been overlaid that demonstrates the spread of the entire dataset.
+
+knitr::include_graphics(glue("{output_path}/midshelf_plot.png"), error = F, rel_path = F)
+
+```
+
+The Offshore Zone
+
+```{r}
+#| label: show offshore eReefs raw data map
+#| output: true
+#| fig-cap: A map of a single day of Chlorophyll a data in the Offshore Marine Zone.
+
+knitr::include_graphics(glue("{output_path}/offshore_map.png"), error = F, rel_path = F)
+
+```
+
+```{r}
+#| label: show offshore eReefs raw data plot
+#| output: true
+#| fig-cap: A plot of daily eReefs Chlorophyll a data in the Offshore Marine Zone. Red dots are values recorded during the dry season (May to October), and teal dots are values recorded during the wet season (November - April). The black dashed line represents the WQO value of 0.4ug/L, the purple solid line is the mean Chlorophyll a value for the financial year, the green solid line is the median value, and the blue line is the daily mean Chlorophyll a value. A violin plot has been overlaid that demonstrates the spread of the entire dataset.
+
+knitr::include_graphics(glue("{output_path}/offshore_plot.png"), error = F, rel_path = F)
+
+```
+
+Finally, with this context about where the data is located, how the data trends over time for each of these locations, and how the data compares to the proposed water quality objectives we can begin to run through the three methods of analyzing the data.
+
+## Proposed Scoring Methods Analysis
+
+We can now begin exploring each of the three proposed methods of scoring. These methods are very similar to each other, and leverage the learnings from each method to build to one "greater" method that encompasses the key points of each previous method. However, it is still important to recognise that each of these methods are distinct and could stand alone if necessary. Below we present a short summary of each method before starting:
+
+**Method 1:**
+
+This method is based on the original eReefs scoring that was done back in ~2017 and is as follows:
+
+1. Aggregate data into monthly average chla concentrations (still maintaining spatial information).
+2. Compare each cell in the monthly average against the WQO value and determine if the value is above or below.
+3. Calculate the ratio of above/below values (summing across all monthly) to determine the final score out of 100.
+
+A visually example of this is presented below:
+
+```{r}
+#| label: show example image 1
+#| output: true
+
+knitr::include_graphics("/references/images/n3_ereefs_s5-historical-scores/method_1_example.png", error = F, rel_path = F)
+
+```
+
+**Method 2:**
+
+This method acts as an "in between" option between Methods 1 and 3 and is as follows:
+
+1. Aggregate data into **annual** average chla concentrations (still maintaining spatial information).
+2. Compare each cell in the annual average against the WQO value and determine if the value is above or below.
+3. Calculate the ratio of above/below values to determine the final score out of 100.
+
+Note, there is limited foundation that calls for the use of this method, but the method is completed along the way to method 3, so should be included out of interest.
+
+A visually example of this is presented below:
+
+```{r}
+#| label: show example image 2
+#| output: true
+
+knitr::include_graphics("/references/images/n3_ereefs_s5-historical-scores/method_2_example.png", error = F, rel_path = F)
+
+```
+
+**Method 3:**
+
+This method is based on the Modified Amplitude scoring system used in the inshore marine water quality analysis and attempts to best replicate the inshore method. This method was also originally used by Murray Logan during his preliminary exploration of eReefs. The method is as follows:
+
+1. Aggregate data into **annual** average chla concentrations (still maintaining spatial information)
+2. Compare each cell in the annual average against the WQO value and score the cell using the following formula: log2(WQO/mean) where scores are capped at -1 and +1.
+3. Calculate the mean value of scored cells.
+4. Standardize the mean value to a scale of 0 - 100 using the scaling system implemented in the inshore marine water quality method.
+
+A visually example of this is presented below:
+
+```{r}
+#| label: show example image 3
+#| output: true
+
+knitr::include_graphics("/references/images/n3_ereefs_s5-historical-scores/method_3_example.png", error = F, rel_path = F)
+
+```
+
+### Method 1
+
+We will now start the actually steps of Method 1. Firstly, to help organize the outputs, we will create a sub folder to store all of the upcoming outputs and results from this method (each method will get its own sub folder).
+
+```{r}
+#| label: create method 1 sub folder
+
+#update path
+output_path <- glue("{output_path}/method_1")
+
+#create directory
+dir.create(output_path)
+
+```
+
+Step 1 of this method is to obtain monthly mean values for each of our 15 datasets. To achieve this we unfortunately need to break the datasets up into separate stacks of layers per month to do the mean calculation. Essentially creating 15*12 sets of data. Thankfully, once we have got the monthly average, we can stick each of them back together to return to our 15 total datasets.
+
+```{r}
+#| label: method 1 calculate monthly means
+
+#write a custom function that does each of the required steps to calculate the monthly values
+monthly_mean_data <- map(data_by_zone, function(dataset){
+  
+  #get the list of "times" (dates) stored in the dataset (1 date per layer) and convert it into a dataframe
+  dates <- data.frame(DateTime = st_get_dimension_values(dataset, which = "time"))
+  
+  #extract the year and month and combine into a single unique name and add an index column
+  dates <- dates |> 
+    mutate(Year = year(DateTime),
+           Month = month(DateTime, label = T),
+           RowId = row_number()) |> 
+    unite(LayerName, "Year", "Month", sep = "_")
+  
+  #group by LayerName and get the min and max row index (layer number) for each month, then reorder the dataframe by index
+  dates <- dates |> 
+    group_by(LayerName) |> 
+    summarise(MinIndex = min(RowId),
+              MaxIndex = max(RowId)) |> 
+    arrange(MinIndex)
+  
+  #create a trackers for the objects that will be made
+  created_objects <- c()
+  
+  #loop over each of the unique names
+  for (i in unique(dates$LayerName)){
+  
+    #get the index numbers for the min and max layers from the table
+    min_layer <- dates |> filter(LayerName == i) |> select(MinIndex) |> as.numeric()
+    max_layer <- dates |> filter(LayerName == i) |> select(MaxIndex) |> as.numeric()
+      
+    #extract the month of data using the index numbers [attribute, i (lat), j (long), k (depth), time]
+    monthly_mean <- dataset[,,,,min_layer:max_layer]
+    
+    #and apply the mean function over the i,j dimensions (lat, long)
+    monthly_mean <- st_apply(monthly_mean, 1:2, FUN = mean, keep = TRUE)
+    
+    #assign the monthly_mean dataset to a new object
+    assign(glue("{i}"), monthly_mean)
+    
+    #create a vector that tracks all the names of the created objects
+    created_objects <- c(created_objects, glue("{i}"))
+  
+  }
+  
+  #combine each of the monthly layers into one new dataset ("mget" is "multiple get") and this will be the output of the function
+  dataset <- do.call(c, mget(created_objects))
+  
+})
+
+```
+
+Step 2 of this method is to compare the monthly mean chlorophyll a concentration values against a WQO. Currently this WQO has been set to 0.4ug/L however this is just a temporary value to ensure the methodology is sound and it may change in the future. At this point can also convert the netcdf object into our preferred sf object type (remember the discussion earlier).
+
+```{r}
+#| label: method 1 calculate ratio of success
+
+monthly_mean_df <- map(monthly_mean_data, function(dataset){
+  
+  #apply WQO - the result will be either True or False, where True means the chla value was less than the objective (a good thing)
+  dataset <- dataset <= 0.4
+  
+  #extract the datasets into tables
+  dataset_df <- st_as_sf(dataset, as_points = F, merge = F)
+  
+  #pivot the tables longer to make them easier to work with, split the layer information into Financial Year and month, and order by Month
+  dataset_df <- dataset_df |> 
+    pivot_longer(cols = matches("\\d"), names_to = "Layer", values_to = "Value") |> 
+    separate(Layer, into = c("FinancialYear", "Month"), sep = "_", remove = F) |> 
+    mutate(Month = as.factor(Month),
+           Month = fct_relevel(Month, "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", 
+                               "Mar", "Apr", "May", "Jun"))
+  
+  #return the object
+  return(dataset_df)
+  
+})
+
+```
+
+It should be noted that when we are doing this comparison against the WQO the result is boolean, i.e., True or False. We have the luxury of picked what these mean, and for this scenario we have defined TRUE = Less than WQO (i.e. True is good). Please remember this when looking at the results.
+
+#### Create Maps
+
+Before completing step 3 of this process (getting the final scores) we will take a moment to use the newly polygonised datasets (i.e. made it sf objects) to create a variety of facet maps showing the spatial distribution of the TRUE/FALSE values.
+
+```{r}
+#| label: method 1 create monthly facet maps
+
+#for each sf dataframe in our list
+for (i in 1:length(monthly_mean_df)){
+  
+  #create the map
+  map <- tm_shape(qld) +
+    tm_polygons(fill = "grey80") +
+    tm_shape(dt_land_region) +
+    tm_polygons(fill = "grey90", 
+                col = "black") +
+    tm_shape(monthly_mean_df[[i]], is.main = T) +
+    tm_polygons(fill = "Value", 
+                fill.scale = tm_scale_categorical(values = c("TRUE" = "#97D86C", "FALSE" = "#C97064")),
+                col_alpha = 0) +
+    tm_facets(by = "Month") +
+    tm_shape(dt_marine_region) +
+    tm_borders(col = "black") +
+    tm_layout(legend.bg.color = "white", 
+              legend.frame = "black", 
+              legend.position = c("left", "bottom"),
+              asp = 1.1)
+
+  #and save
+  tmap_save(map, glue("{output_path}/{name_list[[i]]}.png"))
+  
+}
+
+```
+
+There were 15 facet maps created. One for each of the Financial Year x Marine Zone combinations. Below is just one example of these maps, note again that TRUE = Less than WQO.
+
+```{r}
+#| label: method 1 show monthly facet map
+#| output: true
+#| fig-cap: A map of monthly mean chlorophyll a values in the Coastal Marine Zone of the Dry Tropics Region (Financial Year 2020-2021). TRUE (green) cells indidicate a mean chlorophyll a value below the WQO of 0.4ug/L, while FALSE (red) cells indidicate a mean chlorophyll a value above the WQO.
+
+knitr::include_graphics(glue("{output_path}/coastal_20_21.png"), error = F, rel_path = F)
+
+```
+
+With the detour to create the monthly facet maps completed we can move on to step 3 of this method, calculating the annual score. During this process we will also take time to calculate additional summary statistics about the dataset.
+
+```{r}
+#| label: method 1 calculate summary statistics
+
+#run a custom function that extracts our summary statistics and final scores
+monthly_mean_df <- map(monthly_mean_df, function(dataset){
+
+  #summarise the dataframe to count just the total true and false values per month
+  monthly_total_statistics <- dataset |> 
+    st_drop_geometry() |> 
+    group_by(Layer, Value) |> 
+    summarise(Count = n()) |> 
+    ungroup()
+  
+  #extract rows that don't have both T and F values
+  single_rows <- monthly_total_statistics |> 
+    group_by(Layer) |> 
+    filter(n() == 1) |> 
+    ungroup()
+  
+  #update these single rows to be the "opposite" of what already exists (flip T to F or F to T etc.)
+  single_rows <- single_rows |> 
+    mutate(Value = case_when(Value == FALSE ~ TRUE,
+                             Value == TRUE ~ FALSE),
+           Count = 0)
+  
+  #bind the single rows back to the main dataset
+  monthly_total_statistics <- monthly_total_statistics |> 
+    bind_rows(single_rows)
+  
+  #calculate some annual statistic as well
+  annual_total_statistics <- monthly_total_statistics |> 
+    group_by(Value) |>  
+    summarise(Count = sum(Count)) |> 
+    mutate(Layer = "Annual Statistics") |> 
+    ungroup()
+  
+  #bind both of these together
+  monthly_total_statistics <- monthly_total_statistics |> 
+    bind_rows(annual_total_statistics)
+  
+  #calculate the ratio of T to F for each month and for the total
+  monthly_total_statistics <- monthly_total_statistics |>
+    group_by(Layer) |> 
+    mutate(Ratio = round(Count/sum(Count),2)) |> 
+    ungroup()
+  
+  #convert the ratio into a score for the layer and order each dataframe by layer to make things look nicer later
+  monthly_total_statistics <- monthly_total_statistics |> 
+    group_by(Layer) |> 
+    mutate(Score = case_when(Value == TRUE ~ Ratio*100,
+                             T ~ NA)) |> 
+    ungroup() |> 
+    arrange(Layer)
+  
+})
+
+```
+
+With the scores now calculated, the datasets can be combined into one single dataframe and saved into a few different versions that focus on different parts of the results.
+
+```{r}
+#| label: method 1 save dataframes
+
+#add a column id
+method_1_final_df <- map2(monthly_mean_df, name_list, ~ mutate(.x, ColumnId = .y))
+
+#combine the dataframes
+method_1_final_df <- bind_rows(method_1_final_df)  
+
+#save this as the full raw dataset
+write_csv(method_1_final_df, glue("{output_path}/full_raw_output.csv"))
+
+#split the layer column into two and update the year column to be financial
+method_1_final_scores <- method_1_final_df |> 
+  separate(Layer, into = c("Year", "Month"), sep = "_") |> 
+  mutate(Month = case_when(is.na(Month) ~ Year, T ~ Month),
+         Year = case_when(str_detect(ColumnId, "19_20") ~ "2019-2020",
+                          str_detect(ColumnId, "20_21") ~ "2020-2021",
+                          str_detect(ColumnId, "21_22") ~ "2021-2022",
+                          str_detect(ColumnId, "22_23") ~ "2022-2023",
+                          str_detect(ColumnId, "23_24") ~ "2023-2024",
+                          T ~ Year), 
+         ColumnId = str_remove_all(ColumnId, "_\\d+_\\d+"))
+         
+         
+#pivot data wider to make it easier to read then change the order of the rows for saving
+method_1_final_scores <- method_1_final_scores |> 
+  select(-c(Count, Ratio, Value)) |> 
+  filter(!is.na(Score)) |> 
+  pivot_wider(names_from = Year, values_from = c(Score)) |> 
+  mutate(Month = as.factor(Month),
+         Month = fct_relevel(Month, "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", 
+                             "Mar", "Apr", "May", "Jun", "Annual Statistics")) |> 
+  arrange(Month)
+
+#load in custom scoring function
+source(here("functions/cond_form_rc_grades.R"))
+
+#save the score dataframe
+cond_form_rc_grades(method_1_final_scores, glue("{output_path}/method_1_final_scores"), cols = 3:7, method = "numeric")
+
+```
+
+To round things out, below is the scored table that we saved:
+
+```{r}
+#| label: show the table
+#| output: true
+
+#read in the custom function to style tables
+source(here("functions/cond_form_tables.R"))
+
+method_1_final_scores <- method_1_final_scores |> arrange(ColumnId)
+
+#run function then add additional formatting
+cond_form_tables(method_1_final_scores, header_rows = 1, landscape = F, score_colour = T) |> 
+  set_align(everywhere, everywhere, "center") |> 
+  set_valign(everywhere, everywhere, "middle")
+
+```
+
+### Method 2
+
+We will now start the actually steps of Method 2. Firstly, to help organize the outputs, we will create a sub folder to store all of the upcoming outputs and results from this method (each method will get its own sub folder).
+
+```{r}
+#| label: create method 2 sub folder
+
+#remove the old folder path from the variable
+output_path <- str_remove_all(output_path, "/method_1")
+
+#update path
+output_path <- glue("{output_path}/method_2")
+
+#create directory
+dir.create(output_path)
+
+```
+
+For method 2, we are basically repeating the steps of method one, but aggregating to the annual level instead. Thankfully, because we no longer have to break the datasets up by month this is actually achieved fairly quickly below:
+
+```{r}
+#| label: method 2 calculate annual means
+
+#simply apply the mean function to each of the datasets, working over the i (lat) and j (lon) dimensions
+annual_mean_data <- map(data_by_zone, ~ st_apply(.x, 1:2, FUN = mean, keep = TRUE))
+
+#update the name of the column to make more sense
+annual_mean_data <- map(annual_mean_data, ~rename(.x, BelowWqo = "mean"))
+
+```
+
+Step 2 for this method remains the same as in method 1, comparing the annual values against the WQO, extracting the data into a table, and rearrange that table to be in a nicer format for our next few steps. Noting again, that TRUE = below the WQO.
+
+```{r}
+#| label: method 2 calculate ratio of success annually
+
+#apply the condition (greater or less than 0.4) to each of the datasets in the list
+annual_mean_data <- map(annual_mean_data, function(x) x <= 0.4)
+
+#extract each of the datasets into tables
+annual_mean_df <- map(annual_mean_data, ~ st_as_sf(., as_points = F, merge = F))
+
+```
+
+We now have a list of sf data frames that contain polygonised information of the original rasters. These sf data frames contain one column for the pass/fail of the cell (each row is one cell on the map).
+
+#### Create Maps
+
+Once again, we will take a moment to detour and create some maps demonstrating the results of this method visually.
+
+```{r}
+#| label: method 2 create annual maps
+
+#for each sf dataframe in our list
+for (i in 1:length(annual_mean_df)){
+  
+  #create the map
+  map <- tm_shape(qld) +
+    tm_polygons(fill = "grey80") +
+    tm_shape(dt_land_region) +
+    tm_polygons(fill = "grey90", 
+                col = "black") +
+    tm_shape(annual_mean_df[[i]], is.main = T) +
+    tm_polygons(fill = "BelowWqo", 
+                fill.scale = tm_scale_categorical(values = c("TRUE" = "#97D86C", "FALSE" = "#C97064")),
+                col_alpha = 0) +
+    tm_shape(dt_marine_region) +
+    tm_borders(col = "black") +
+    tm_layout(legend.bg.color = "white", 
+              legend.frame = "black", 
+              legend.position = c("left", "bottom"),
+              asp = 1.1)
+
+  #and save
+  tmap_save(map, glue("{output_path}/{name_list[[i]]}.png"))
+  
+}
+
+```
+ 
+And again, similar to method 1, we will show just one of the maps created for the 15 datasets. From completing method 1 it is not surprisingly to see that most, if not all, of the map shows that the annual mean rarely exceeds the WQO.
+
+```{r}
+#| label: method 2 show annual map
+#| output: true
+#| fig-cap: A map of annual mean chlorophyll a values in the Coastal Marine Zone of the Dry Tropics Region (Financial Year 2020-2021). TRUE (green) cells indidicate a mean chlorophyll a value below the WQO of 0.4ug/L, while FALSE (red) cells indidicate a mean chlorophyll a value above the WQO.
+
+knitr::include_graphics(glue("{output_path}/coastal_20_21.png"), error = F, rel_path = F)
+
+```
+
+With the detour to create the maps completed we can move on to step 3 of this method, calculating the annual score. During this process we will also take time to calculate additional summary statistics about the dataset.
+
+```{r}
+#| label: method 2 calculate summary statistics annual
+
+#create a custom function that calculate the summary statistics and score
+annual_mean_df <- map2(annual_mean_df, name_list, function(dataset, names_from_list){
+  
+  #get the total true and false values for each dataset
+  annual_total_statistics <- dataset |> 
+    st_drop_geometry() |>
+    mutate(ColumnId = names_from_list) |> 
+    group_by(ColumnId, BelowWqo) |> 
+    summarise(Count = n()) |> 
+    ungroup()
+
+  #extract rows that don't have both T and F values
+  single_rows <- annual_total_statistics |> 
+    group_by(ColumnId) |> 
+    filter(n() == 1) |> 
+    ungroup()
+  
+  #update these single rows to be the "opposite" of what already exists (flip T to F or F to T etc.)
+  single_rows <- single_rows |> 
+    mutate(BelowWqo = case_when(BelowWqo == FALSE ~ TRUE,
+                                BelowWqo == TRUE ~ FALSE),
+           Count = 0)
+  
+  #bind the single rows back to the main dataset
+  annual_total_statistics <- annual_total_statistics |> 
+    bind_rows(single_rows)
+
+  #calculate the ratio of T to F
+  annual_total_statistics <- annual_total_statistics |>
+    group_by(ColumnId) |> 
+    mutate(Ratio = round(Count/sum(Count),2)) |> 
+    ungroup()
+  
+  #convert the ratio into a score for the layer and order each dataframe by layer to make things look nicer later
+  annual_total_statistics <- annual_total_statistics |> 
+    group_by(ColumnId) |> 
+    mutate(Score = case_when(BelowWqo == TRUE ~ Ratio*100,
+                             T ~ NA)) |> 
+    ungroup() |> 
+    arrange(ColumnId)
+  
+})
+
+```
+
+With the scores now calculated, the datasets can be combined into one single dataframe and saved into a few different versions that focus on different parts of the results.
+
+```{r}
+#| label: method 2 save annual dataframes
+
+#combine the dataframes
+method_2_final_df <- bind_rows(annual_mean_df)  
+
+#save this as the full raw dataset
+write_csv(method_2_final_df, glue("{output_path}/full_raw_output.csv"))
+
+#split the layer column into two and update the year column to be financial
+method_2_final_scores <- method_2_final_df |> 
+  separate(ColumnId, into = c("Marine Zone", "Financial Year"), sep = "_", extra = "merge") |> 
+  mutate(`Financial Year` = case_when(str_detect(`Financial Year`, "19_20") ~ "2019-2020",
+                                      str_detect(`Financial Year`, "20_21") ~ "2020-2021",
+                                      str_detect(`Financial Year`, "21_22") ~ "2021-2022",
+                                      str_detect(`Financial Year`, "22_23") ~ "2022-2023",
+                                      str_detect(`Financial Year`, "23_24") ~ "2023-2024",
+                                      T ~ `Financial Year`))
+         
+         
+#pivot data wider to make it easier to read then change the order of the rows for saving
+method_2_final_scores <- method_2_final_scores |> 
+  select(-c(Count, Ratio, BelowWqo)) |> 
+  filter(!is.na(Score)) |> 
+  pivot_wider(names_from = `Financial Year`, values_from = c(Score))
+
+#save the score dataframe
+cond_form_rc_grades(method_2_final_scores, glue("{output_path}/method_2_final_scores"), cols = 2:6, method = "numeric")
+
+```
+
+Below is the scored table that we saved:
+
+```{r}
+#| label: show the annual table
+#| output: true
+
+#run function then add additional formatting
+cond_form_tables(method_2_final_scores, header_rows = 1, landscape = F, score_colour = T) |> 
+  set_align(everywhere, everywhere, "center") |> 
+  set_valign(everywhere, everywhere, "middle")
+
+```
+
+### Method 3
+
+We will now start the actually steps of Method 2. Firstly, to help organize the outputs, we will create a sub folder to store all of the upcoming outputs and results from this method (each method will get its own sub folder).
+
+```{r}
+#| label: create method 3 sub folder
+
+#remove the old folder path from the variable
+output_path <- str_remove_all(output_path, "/method_2")
+
+#update path
+output_path <- glue("{output_path}/method_3")
+
+#create directory
+dir.create(output_path)
+
+```
+
+For method 3, we are going to utilise some of the things learnt during method 2. Step 1 is to calculate the annual mean for each dataset:
+
+```{r}
+#| label: method 3 calculate annual means
+
+#simply apply the mean function to each of the datasets, working over the i (lat) and j (lon) dimensions
+annual_mean_data <- map(data_by_zone, ~ st_apply(.x, 1:2, FUN = mean, keep = TRUE, rename = F))
+
+```
+
+Followed by step 2 which is to apply the inshore marine scoring function to each cell in each dataset. The specific function used is as follows:
+
+score = log2(WQO/value)
+
+where scores >1 are capped at 1, and scores <-1 are capped at -1.
+
+```{r}
+#| label: method 3 create and run scoring function
+
+#create a function that ingests a list of stars object
+annual_mean_data <- map(annual_mean_data, function(dataset) {
+  
+  #use the st_apply function to apply a function to specific dimensions of the stars data
+  st_apply(dataset, MARGIN = c(1, 2), FUN = function(value_in_dataset) {
+    
+    #this is the actual function, divide the wqo by the score then log2 the result
+    score <- log2(0.4 / value_in_dataset)
+    
+    #if the result is greater or less than +1 or -1, cap the value, otherwise leave it.
+    score <- ifelse(score <= -1, -1, ifelse(score >= 1, 1, score))
+    
+    return(score)
+  })
+})
+
+```
+
+Once this scoring function has been applied to the data we can complete the extraction of the data from the netcdf format to our preferred sf dataframe. Then, using the easier to work with format, rename and the column to a more understandable title, and then convert the -1 to +1 scores to our preferred scoring range of 0 to 100
+
+```{r}
+#| label: method 3 extract data to sf object
+
+#write a custom function to convert to sf, change the column name, and change the scoring range
+annual_mean_df <- map(annual_mean_data, function(dataset){
+  
+  #convert to a sf object
+  dataset_df <- st_as_sf(dataset, as_points = F, merge = F)
+  
+  #rename the column temporarily to make the next step easy to read
+  dataset_df <- rename(dataset_df, Col = `Chla ug/L`)
+  
+  #convert the scores from -1 to +1, over to 0 to 100 and floor round the values
+  dataset_df <- dataset_df |> 
+    mutate(Col = case_when(Col >= 0.51 ~ 100 - (19 - ((Col - 0.51) * (19/0.49))),
+                           Col >= 0 & Col < .51 ~ 80.9 - (19.9 - (Col * (19.9/0.50))),
+                           Col >= -0.33 & Col < -0.01 ~ 60.9 - (19.9 - ((Col + 0.33) * (19.9/0.32))),
+                           Col >= -0.66 & Col < -0.34 ~ 40.9 - (19.9 - ((Col + 0.66) * (19.9/0.32))),
+                           TRUE ~ 20.9 - (20.9 - ((Col + 1) * (20.9/0.34)))),
+           Col = floor(Col))
+  
+  #then rename the column again properly
+  dataset_df <- rename(dataset_df, StandardisedScore = Col)
+  
+})
+
+```
+
+We now have a list of sf data frames that contain polygonised information of the original rasters. These sf data frames contain the standardised scores for chlorphyll a using the inshore water quality scoring function against a WQO of 0.4.
+
+#### Create Maps
+
+Once again, we will take a moment to detour and create some maps demonstrating the results of this method visually.
+
+```{r}
+#| label: method 3 create annual maps
+
+#create a custom set of breaks and colours for the map
+breaks <- c(0, 20, 40, 60, 80, 100)
+colors <- c("#FF0000", "#FFC000", "#FFFF00", "#92D050", "#00B050")
+
+#for each sf dataframe in our list
+for (i in 1:length(annual_mean_df)){
+  
+  #create the map
+  map <- tm_shape(qld) +
+    tm_polygons(fill = "grey80") +
+    tm_shape(dt_land_region) +
+    tm_polygons(fill = "grey90", 
+                col = "black") +
+    tm_shape(annual_mean_df[[i]], is.master = T) +
+    tm_polygons(fill = "StandardisedScore", 
+                fill.scale = tm_scale_intervals(values = colors,
+                                                 breaks = breaks),
+                fill.legend = tm_legend(reverse = T)) +
+    tm_shape(dt_marine_region) +
+    tm_borders(col = "black") +
+    tm_layout(legend.bg.color = "white", 
+              legend.frame = "black", 
+              legend.position = c("left", "bottom"),
+              asp = 1.1)
+
+  #and save
+  tmap_save(map, glue("{output_path}/{name_list[[i]]}.png"))
+  
+}
+
+```
+ 
+And again, similar to method 2, we will show just one of the maps created for the 15 datasets. From completing methods 1 and 2 it is not surprisingly to see that most, if not all, of the map shows that the annual mean rarely exceeds the WQO, however by using this scoring method we can see with much more clarity where exactly the annual mean is the closest/further from the WQO.
+
+```{r}
+#| label: method 3 show annual map
+#| output: true
+#| fig-cap: A map of annual mean chlorophyll a values in the Offshore Marine Zone of the Dry Tropics Region (Financial Year 2022-2023). The colour scale is identical to that currently used by the regional report card network.
+
+knitr::include_graphics(glue("{output_path}/offshore_22_23.png"), error = F, rel_path = F)
+
+```
+
+With the detour to create the maps completed we can move on to extracting the annual score into a easily readable table. During this process we will also take time to calculate additional summary statistics about the dataset.
+
+```{r}
+#| label: method 3 calculate summary statistics annual 
+
+#create a custom function that calculate the summary statistics and score
+annual_mean_df <- map2(annual_mean_df, name_list, function(dataset, names_from_list){
+
+  #get the mean score for each dataset and add an identifying column
+  annual_total_statistics <- dataset |> 
+    st_drop_geometry() |>
+    mutate(ColumnId = names_from_list) |> 
+    group_by(ColumnId) |> 
+    summarise(StandardisedScore = mean(StandardisedScore, na.rm = T)) |> 
+    ungroup()
+  
+})
+
+```
+
+With the scores now calculated and stored in a list of datasets, the datasets can then be combined into one single dataframe and saved into a few different versions that focus on different parts of the results.
+
+The data can then be combined into one large dataset for exploration and saving.
+
+```{r}
+#| label: method 3 save annual dataframes
+
+#combine the dataframes
+method_3_final_df <- bind_rows(annual_mean_df)  
+
+#save this as the full raw dataset
+write_csv(method_3_final_df, glue("{output_path}/full_raw_output.csv"))
+
+#split the layer column into two and update the year column to be financial
+method_3_final_scores <- method_3_final_df |> 
+  separate(ColumnId, into = c("Marine Zone", "Financial Year"), sep = "_", extra = "merge") |> 
+  mutate(`Financial Year` = case_when(str_detect(`Financial Year`, "19_20") ~ "2019-2020",
+                                      str_detect(`Financial Year`, "20_21") ~ "2020-2021",
+                                      str_detect(`Financial Year`, "21_22") ~ "2021-2022",
+                                      str_detect(`Financial Year`, "22_23") ~ "2022-2023",
+                                      str_detect(`Financial Year`, "23_24") ~ "2023-2024",
+                                      T ~ `Financial Year`),
+         across(where(is.numeric), floor))
+         
+         
+#pivot data wider to make it easier to read then change the order of the rows for saving
+method_3_final_scores <- method_3_final_scores |> 
+  pivot_wider(names_from = `Financial Year`, values_from = c(StandardisedScore))
+
+#save the score dataframe
+cond_form_rc_grades(method_3_final_scores, glue("{output_path}/method_3_final_scores"), cols = 2:6, method = "numeric")
+
+```
+
+Below is the scored table that we saved:
+
+```{r}
+#| label: method 3 show the annual table 
+#| output: true
+
+#run function then add additional formatting
+cond_form_tables(method_3_final_scores, header_rows = 1, landscape = F, score_colour = T) |> 
+  set_align(everywhere, everywhere, "center") |> 
+  set_valign(everywhere, everywhere, "middle")
+
+```
+
+# Discussion
+
+Each of the three methods have now been completed, the results calculated, the data mapped, and scoring tables summarised. So far each of these methods have been reviewed independently. Below we make an effort to compare the results from each, for the sake of simplicity we will only look at the annual results, and ignore the monthly results from method 1.
+
+```{r}
+#| label: compare results from the three methods
+
+#remove the monthly data from method 1 results and add a data identifier
+method_1_final_scores <- method_1_final_scores |> 
+  filter(Month == "Annual Statistics") |> 
+  select(-Month) |>
+  rename("MarineZone" = ColumnId) |> 
+  mutate(DataId = "Method 1")
+
+#update the column name and add a data identifier
+method_2_final_scores <- method_2_final_scores |> 
+  rename("MarineZone" = "Marine Zone") |> 
+  mutate(DataId = "Method 2")
+
+#update the column name and add a data identifier
+method_3_final_scores <- method_3_final_scores |> 
+  rename("MarineZone" = "Marine Zone") |> 
+  mutate(DataId = "Method 3")
+
+#combine the three datasets together
+all_final_scores <- rbind(method_1_final_scores, method_2_final_scores, method_3_final_scores)
+
+#reorder the columns and rows of data
+all_final_scores <- all_final_scores |> 
+  relocate(DataId, .before = MarineZone) |> 
+  mutate(MarineZone = as.factor(MarineZone),
+         MarineZone = fct_relevel(MarineZone, "coastal", "midshelf", "offshore"))
+
+```
+
+Here is all the data compiled together:
+
+```{r}
+#| label: show all scores together
+#| output: true
+
+#set the output_path back to the main folder
+output_path <- str_remove_all(output_path, "/method_3")
+
+#save the score dataframe
+cond_form_rc_grades(all_final_scores, glue("{output_path}/all_final_scores"), cols = 3:7, method = "numeric")
+
+#run function then add additional formatting
+cond_form_tables(all_final_scores, header_rows = 1, landscape = F, score_colour = T) |> 
+  set_align(everywhere, everywhere, "center") |> 
+  set_valign(everywhere, everywhere, "middle")
+
+```
+
+And here is the data plotted over time:
+
+```{r}
+#| label: plot all scores together p1
+
+#pivot data back to the long format so it is easier to work with for plotting and extract a workable year number
+all_final_scores <- all_final_scores |> 
+  pivot_longer(cols = 3:7, names_to = "Financial Year", values_to = "Standardised Score") |> 
+  separate_wider_delim(`Financial Year`, names = c(NA, "Year"), delim = "-", cols_remove = F) |> 
+  mutate(Year = as.numeric(Year))
+
+#create a table that contains background information for our plot
+background_grades <- data.frame(Name = c("E", "D", "C", "B", "A"),
+                                Start = as.numeric(c("0", "20", "40", "60","80")),
+                                End = as.numeric(c("20", "40", "60", "80", "100")),
+                                Level = c("Very poor", "Poor", "Moderate", "Good", "Very good")) |> 
+  mutate(median_x = Start + floor((End-Start)/2))
+
+#create the plot, this isn't the cleanest, but it gets the job done
+ggplot(all_final_scores) +
+  geom_rect(data = background_grades, aes(NULL, NULL, xmin = -Inf, xmax = Inf, fill = Name, ymin = Start, ymax = End), alpha = 0.4) +
+  scale_fill_manual(values = c("A" = "#00B050", "B" = "#92D050", "C" = "#FFFF00", "D" = "#FFC000", "E" = "#FF0000"),
+                    name = "Grade",
+                    labels = c("Very Good (81-100)", "Good (61-80)", "Moderate (41-60)", "Poor (21-40)", "Very Poor (0-20)")) +
+  geom_point(aes(x = Year, y = `Standardised Score`, group = DataId, colour = DataId, shape = DataId), size = 1.5, alpha = 0.7) +
+  geom_line(aes(x = Year, y = `Standardised Score`, group = DataId, colour = DataId), size = 0.8, alpha = 0.7) +
+  scale_shape_manual(name = "Method of Scoring",
+                     values = c(15, 16, 17),  
+                     labels = c("Method 1", "Method 2", "Method 3")) +  
+  scale_colour_manual(name = "Method of Scoring",  
+                     values = c("black", "grey25", "grey60"), 
+                     labels = c("Method 1", "Method 2", "Method 3")) + 
+  scale_linetype_manual(name = "Method of Scoring",  
+                        values = c("dashed", "solid", "dotted"), 
+                        labels = c("Method 1", "Method 2", "Method 3")) + 
+  facet_wrap( ~ MarineZone, ncol = 1) +
+  scale_y_continuous(limits = c(0, 100)) +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Financial Year",
+       y = "Standardized Score")
+
+#save the plot
+ggsave(glue("{output_path}/all_scores_compared.png"))
+
+
+```
+
+```{r}
+#| label: show comparison scores plot p1
+#| output: true
+#| fig-cap: A comparison of chlorophyll a scores in the Coastal, Midshelf, and Offshore Marine Zones of the Dry Tropics Region as derived by three different methods. 
+
+knitr::include_graphics(glue("{output_path}/all_scores_compared.png"), error = F, rel_path = F)
+
+```
+
+Also, given their relative similarities, below is a zoomed in version of the same plot:
+
+```{r}
+#| label: plot all scores together p2
+
+#create a table that contains background information for our zoomed in version of the plot
+background_grades <- data.frame(Name = c("C", "B", "A"),
+                                Start = as.numeric(c("40", "60","80")),
+                                End = as.numeric(c("60", "80", "100")),
+                                Level = c("Moderate", "Good", "Very good")) |> 
+  mutate(median_x = Start + floor((End-Start)/2))
+
+#create the plot, this isn't the cleanest, but it gets the job done
+ggplot(all_final_scores) +
+  geom_rect(data = background_grades, aes(NULL, NULL, xmin = -Inf, xmax = Inf, fill = Name, ymin = Start, ymax = End), alpha = 0.4) +
+  scale_fill_manual(values = c("A" = "#00B050", "B" = "#92D050", "C" = "#FFFF00"),
+                    name = "Grade",
+                    labels = c("Very Good (81-100)", "Good (61-80)", "Moderate (41-60)")) +
+  geom_point(aes(x = Year, y = `Standardised Score`, group = DataId, colour = DataId, shape = DataId), size = 1.5, alpha = 0.7) +
+  geom_line(aes(x = Year, y = `Standardised Score`, group = DataId, colour = DataId), size = 0.8, alpha = 0.7) +
+  scale_shape_manual(name = "Method of Scoring",
+                     values = c(15, 16, 17),  
+                     labels = c("Method 1", "Method 2", "Method 3")) +  
+  scale_colour_manual(name = "Method of Scoring",  
+                     values = c("black", "grey25", "grey60"), 
+                     labels = c("Method 1", "Method 2", "Method 3")) + 
+  scale_linetype_manual(name = "Method of Scoring",  
+                        values = c("dashed", "solid", "dotted"), 
+                        labels = c("Method 1", "Method 2", "Method 3")) + 
+  facet_wrap( ~ MarineZone, ncol = 1) +
+  scale_y_continuous(limits = c(40, 100)) +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Financial Year",
+       y = "Standardized Score")  
+
+#save the plot
+ggsave(glue("{output_path}/all_scores_compared_zoomed.png"))
+
+
+```
+
+```{r}
+#| label: show comparison scores plot p2
+#| output: true
+#| fig-cap: A zoomed in version of the same comparison of chlorophyll a scores in the Coastal, Midshelf, and Offshore Marine Zones of the Dry Tropics Region as derived by three different methods. 
+
+knitr::include_graphics(glue("{output_path}/all_scores_compared_zoomed.png"), error = F, rel_path = F)
+
+```
+
+Upon inspecting the table and plots it is immediately obvious that the broad aspects of each method are the same. All three methods score chlorophyll a highly (at least one score of >100 for each method) and all three methods pick up on the increased concentrations of chla in the first and final years of reporting. Although, it should be noted that both of these "lower scores" are likely influenced by the incomplete datasets used for these years (2019-2020 only had 215 days of data, 2023-2024 only had 200). However, when comparing the exact scores, Method 2 is demonstrated to be less sensitive to change, and in several cases did not demonstrate a change in score despite both Method 1 and 3 have changes greater than 15 (e.g. Coastal Marine Zone, 2020-2021, Method 1 decreased to 85, Method 3 decreased to 81). 
+
+It is recommended that either Method 1 or Method 3 are considered for use due to their increased sensitivity to changes in chlorophyll a concentration. Both of these methods have a precedent for use, and have a robust and logical methodology behind their results. Method 1 was the original method used by the Dry Tropics Partnership in 2018 when the first iteration of eReefs data was trialed, and the scoring system for Method 3 is currently in use to score a range of nutrient and physical-chemical related water quality indicators in the inshore marine zone. Further, in both cases these methods also demonstrated a change in grade (from "very good" to "good" (scores of 80 and 69)) whilst method 2 did not (score of 93), suggesting the possibility of measurable change over time.
+
+Regarding the ability to demonstrate changes in concentration and chla scores over time, it is hypothesized that Method 1's sensitivity is derived from its monthly aggregation method, that provides greater weighting to seasonal spikes in chlorophyll concentrations, whilst Method 3's sensitivity is derived from its scoring factor - which allows for a greater range of results (more than just pass/fail) and compensates for its annual aggregation method. Further exploration of a combination of Method 1's monthly aggregation and Method 3's  Modified Amplitude scoring system is suggested and has been scheduled.
+
+Earlier in this report it was highlighted that the Water Quality Objective (WQO) currently in use is set to 0.4ug/L in all cases, and that the mean of the data is used to compared against this objective. This WQO has been used as it was the original objective used for during the first iteration of eReefs data in 2018, however it is acknowledged that there is the possibility of updating this value. For example, in the Dry Tropics Region, the chlorophyll a WQOs used in the Inshore Marine Zone range from 0.45ug/L up to 2.6ug/L (both comparing against mean values). Conversely the very same documents used to derive these Inshore objectives provide guidelines for the use of the values "0.27, 0.35, and 0.63" (20th, 50th, 80th) when measuring chlorophyll a concentrations "seaward of the plume line" (i.e. the Offshore Zone), and scoring the **median** value against these objectives. It is hypothesized that a lower WQO concentration value will provide a greater level of variation in the chlorophyll a scores calculated by each method, however a detailed exploration has not been conducted. An example of the results expected from Method 3 using a WQO of 0.35 and comparing against a median are presented below, noting that it is unclear if the use of a median value is appropriate with the  Modified Amplitude scoring system.
+
+```{r}
+#| label: trial an updated WQO and median value
+
+#simply apply the mean function to each of the datasets, working over the i (lat) and j (lon) dimensions
+annual_median_data <- map(data_by_zone, ~ st_apply(.x, 1:2, FUN = median, keep = TRUE, rename = F))
+
+#create a function that ingests a list of stars object
+annual_median_data <- map(annual_median_data, function(dataset) {
+  
+  #use the st_apply function to apply a function to specific dimensions of the stars data
+  st_apply(dataset, MARGIN = c(1, 2), FUN = function(value_in_dataset) {
+    
+    #this is the actual function, divide the wqo by the score then log2 the result
+    score <- log2(0.35 / value_in_dataset)
+    
+    #if the result is greater or less than +1 or -1, cap the value, otherwise leave it.
+    score <- ifelse(score <= -1, -1, ifelse(score >= 1, 1, score))
+    
+    return(score)
+  })
+})
+
+#write a custom function to convert to sf, change the column name, and change the scoring range
+annual_median_df <- map(annual_median_data, function(dataset){
+  
+  #convert to a sf object
+  dataset_df <- st_as_sf(dataset, as_points = F, merge = F)
+  
+  #rename the column temporarily to make the next step easy to read
+  dataset_df <- rename(dataset_df, Col = `Chla ug/L`)
+  
+  #convert the scores from -1 to +1, over to 0 to 100 and floor round the values
+  dataset_df <- dataset_df |> 
+    mutate(Col = case_when(Col >= 0.51 ~ 100 - (19 - ((Col - 0.51) * (19/0.49))),
+                           Col >= 0 & Col < .51 ~ 80.9 - (19.9 - (Col * (19.9/0.50))),
+                           Col >= -0.33 & Col < -0.01 ~ 60.9 - (19.9 - ((Col + 0.33) * (19.9/0.32))),
+                           Col >= -0.66 & Col < -0.34 ~ 40.9 - (19.9 - ((Col + 0.66) * (19.9/0.32))),
+                           TRUE ~ 20.9 - (20.9 - ((Col + 1) * (20.9/0.34)))),
+           Col = floor(Col))
+  
+  #then rename the column again properly
+  dataset_df <- rename(dataset_df, StandardisedScore = Col)
+  
+})
+
+#create a custom set of breaks and colours for the map
+breaks <- c(0, 20, 40, 60, 80, 100)
+colors <- c("#FF0000", "#FFC000", "#FFFF00", "#92D050", "#00B050")
+
+#create the map
+map <- tm_shape(qld) +
+  tm_polygons(fill = "grey80") +
+  tm_shape(dt_land_region) +
+  tm_polygons(fill = "grey90", 
+              col = "black") +
+  tm_shape(annual_median_df[[12]], is.main = T) +
+  tm_polygons(fill = "StandardisedScore", 
+              fill.scale = tm_scale_intervals(values = colors,
+                                              breaks = breaks), 
+              legend.reverse = T) +
+  tm_shape(dt_marine_region) +
+  tm_borders(col = "black") +
+  tm_layout(legend.bg.color = "white", 
+            legend.frame = "black", 
+            legend.position = c("left", "bottom"),
+            asp = 1.1)
+
+#and save
+tmap_save(map, glue("{output_path}/{name_list[[12]]}_alternate_wqo.png"))
+
+#create a custom function that calculate the summary statistics and score
+annual_median_df <- map2(annual_median_df, name_list, function(dataset, names_from_list){
+
+  #get the mean score for each dataset and add an identifying column
+  annual_total_statistics <- dataset |> 
+    st_drop_geometry() |>
+    mutate(ColumnId = names_from_list) |> 
+    group_by(ColumnId) |> 
+    summarise(StandardisedScore = mean(StandardisedScore, na.rm = T)) |> 
+    ungroup()
+  
+})
+
+#combine the dataframes
+method_3_test_final_df <- bind_rows(annual_median_df)  
+
+#split the layer column into two and update the year column to be financial
+method_3_test_final_scores <- method_3_test_final_df |> 
+  separate(ColumnId, into = c("Marine Zone", "Financial Year"), sep = "_", extra = "merge") |> 
+  mutate(`Financial Year` = case_when(str_detect(`Financial Year`, "19_20") ~ "2019-2020",
+                                      str_detect(`Financial Year`, "20_21") ~ "2020-2021",
+                                      str_detect(`Financial Year`, "21_22") ~ "2021-2022",
+                                      str_detect(`Financial Year`, "22_23") ~ "2022-2023",
+                                      str_detect(`Financial Year`, "23_24") ~ "2023-2024",
+                                      T ~ `Financial Year`),
+         across(where(is.numeric), floor))
+         
+         
+#pivot data wider to make it easier to read then change the order of the rows for saving
+method_3_test_final_scores <- method_3_test_final_scores |> 
+  pivot_wider(names_from = `Financial Year`, values_from = c(StandardisedScore))
+
+```
+
+These are the Method 3, Mean, 0.4ug/L scores:
+
+```{r}
+#| label: repeat, show method 3 scores
+#| output: true
+
+#run function then add additional formatting
+cond_form_tables(method_3_final_scores, header_rows = 1, landscape = F, score_colour = T) |> 
+  set_align(everywhere, everywhere, "center") |> 
+  set_valign(everywhere, everywhere, "middle")
+
+```
+
+And these are the Method 3, Median, 0.35ug/L scores:
+
+```{r}
+#| label: show alternate WQO scores table
+#| output: true
+
+#run function then add additional formatting
+cond_form_tables(method_3_test_final_scores, header_rows = 1, landscape = F, score_colour = T) |> 
+  set_align(everywhere, everywhere, "center") |> 
+  set_valign(everywhere, everywhere, "middle")
+
+```
+
+```{r}
+#| label: show alternate WQO scores map
+#| output: true
+#| fig-cap: A map of hypothetical chlorophyll a scores should the WQO be updated to 0.35 and the median value used. 
+
+knitr::include_graphics(glue("{output_path}/{name_list[[12]]}_alternate_wqo.png"), error = F, rel_path = F)
+
+```
+
+Inspection of these hypothetical results suggests that only minor changes may occur, however as noted above further exploration is required.
+
+# Conclusion
+
+We can conclude this report by confirming that the eReefs modeled data remains a viable source of information for Chlorophyll a concentration in the Offshore Marine Zone. Scores can be obtained from this dataset effectively, efficiently, and automatically once datasets are made public. The data can be adapted to suit a range of scenarios including obtaining daily information, monthly and yearly aggregations, and spatial visualizations. The results calculated using this data are consistent between methods and marine zones, and with some methods, demonstrate measurable change between years. However, several questions remain regarding the final scoring the results, include:
+
+- What Method should be used?
+- What WQO should be used?
+- And, should the mean or median concentration value be used?
+
+Further research can be conducted to answer these questions, however relevant expert guidance is required to identify the appropriate avenues to pursue.

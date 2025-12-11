@@ -1,0 +1,655 @@
+---
+title: "Northern Three Spatial Analyses (eReefs Linear AIMS Data)"
+author: "Adam Shand"
+date: "`r format(Sys.time(), '%d, %B, %Y')`"
+format: html
+params:
+  project_crs: "EPSG:7844"
+execute: 
+  warning: false
+---
+
+::: {.callout-warning}
+This is an old ereefs script that relies on out of date packages and out of date data. It is been kept in this repo as a history record of what has been trialed in the past. 
+:::
+
+::: {.callout-tip}
+## R Version
+For R session info at the time of rendering this script see @sec-sessioninfo.
+:::
+
+::: {.callout-note}
+This is one part of several scripts exploring CSIRO ereefs data. 
+:::
+
+# Introduction
+
+This script is an exploration of the linear-gridded eReefs datasets provided by AIMS All data is free to download as a .nc file however is only available up to 2019.
+
+The main objectives of this script are to:
+
+ - Explore automated options for data downloading from the AIMS THREDDS servers.
+ - Create a basic methods workflow for future work in this area (noting new data/models are expected to be released soon).
+ - Build a generalized understanding of the automation/scaling that is possible.
+
+# Script Set Up
+
+This script requires multiple core spatial packages, all packages are loaded below.
+
+```{r}
+#| label: install/load packages dependencies
+#| output: false
+
+#library(raster)
+#library(ncdf4)
+#library(ncdf4.helpers)
+library(terra)
+library(glue)
+library(here)
+#library(ggplot2)
+library(sf)
+library(tidyverse)
+library(ereefs)
+library(RNetCDF)
+#library(ggquiver)
+#library(janitor) 
+#library(lubridate)
+#library(leaflet)
+#library(ggmap)
+#library(tidyterra)
+#library(RColorBrewer)
+#library(magick)
+#library(av)
+#library(exactextractr)
+
+```
+
+Then we also need to set up key variables for the script, as well as the output location.
+
+```{r}
+#| label: create save path and establish project crs
+
+#set project crs
+proj_crs <- params$project_crs
+
+#create a file path to help with saving outputs
+save_outputs <- here("outputs/n3_ereefs_linear-grid-aims/")
+
+#create a second path that will be used to save the datasets that we download
+save_data <- here("data/n3_ereefs_linear-grid-aims/")
+
+#bring the paths to life
+dir.create(save_outputs)
+dir.create(save_data)
+
+#turn off s2 geometry
+sf_use_s2(FALSE)
+
+```
+
+# Load Data
+
+Now the script is set up we need to load in all of the required datasets. This will be broken into two segments:
+
+ - Spatial data specific to the N3 region - such as the region, basin, and sub basin boundaries.
+ - eReefs data
+
+## Spatial Data
+
+Spatial data for the northern three regions should be readily available in the repo, the dataset is created by the n3_region-builder.qmd script in the repo that should be the first script run for new users. If the dataset is not available refer back to the README document in the GitHub repo. The other parts of spatial data here should go off without a hitch if the region-builder script has been run.
+
+```{r}
+#| label: load the n3 region
+
+#read in qld outlines data from the gisaimsr package, filter for land and islands, update crs
+qld <- get(data("gbr_feat", package = "gisaimsr")) |> filter(FEAT_NAME %in% c("Mainland", "Island")) |> 
+  st_transform(proj_crs)
+
+#read in the northern three spatial files and reduce down to only the components we need
+n3_region <- st_read(here("data/n3_region-builder/n3_region.gpkg")) |> filter(environment == "Marine")
+
+```
+
+## eReefs Data - AIMS gridded version
+
+The AIMS eReefs THREDDS service offers a variety of options:
+
+ - Model: **Water Movement and Physical Characteristics**, examples of variables:
+    + Temperature
+    + Salinity
+    + Wind
+    + Current
+ - Model: **BioGeoChemical**, examples of variables:
+    + Dissolved Inorganic Nitrogen, nitrate and ammonia
+    + Dissolved Oxygen
+    + Total chlorophyll
+    + etc. (There are more than 200 variables in this model)
+
+And each model also has multiple variations of its output tailored to different conditions such as "baseline" conditions, "pre-industrial" catchment conditions, and "target" catchment conditions.
+
+For this script we will look into two datasets, with the understanding that the methods for each will broadly cover all possible future inquires.
+
+ - General concentration of TN across the N3 region.
+ - Wind vector (direction and velocity) across the N3 region (to understand how to combine two datasets).
+ 
+
+### Download Total Nitrogen (TN) Data
+
+In the below code chunk we download TN data for the entire GBR. Although the file paths may vary as we explore different linear and curvilinear options, the methods of looping/storing are still applicable.
+
+```{r}
+#| label: download ereef TN data
+
+if (file.exists(glue("{save_data}/tn.nc"))){#check if the data has already been download
+
+  #load the data in if so
+  tn <- rast(glue("{save_data}/tn.nc"))
+  
+  message("Files read from local storage.")
+  
+} else {#otherwise download the data
+  
+  #create a bounding box of our study area for downloading
+  n3_bbox <- st_bbox(n3_region)
+  
+  #create the file prefix for the path to download
+  file_prefix <- "https://thredds.ereefs.aims.gov.au/thredds/dodsC/s3://aims-ereefs-public-prod/derived/ncaggregate/ereefs/GBR4_H2p0_B3p1_Cq3b_Dhnd/monthly-monthly/EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_monthly-monthly-"
+  
+  #create an empty rasters to store data
+  tn <- rast()
+  
+  #create a vector of all the dates we want to download
+  date_vector <- sort(c(outer(2018:2018, sprintf(fmt = "%02d", 1:12), paste, sep = "-")))
+  
+  #using variables created in the previous loop
+  for (i in date_vector){
+    
+    #open the connection to the file
+    file_path <- glue("{file_prefix}{i}.nc")
+    server_file <- open.nc(file_path)
+    
+    #read the lat and long of the file we have connected with
+    lon <- var.get.nc(server_file, "longitude")
+    lat <- var.get.nc(server_file, "latitude")
+    
+    #determine the minimum and maximum indices for each of our lats and longs
+    lon_start <- which.min(abs(lon - n3_bbox[1] + 0.1)) #find the index within "lon" that is closest (but more than) n3_bbox[1]
+    lat_start <- which.min(abs(lat - n3_bbox[2] + 0.1))
+    lon_count <- which.min(abs(lon - n3_bbox[3] - 0.1)) - lon_start #find the index for the last lon we want to get
+    lat_count <- which.min(abs(lat - n3_bbox[4] - 0.1)) - lat_start
+    
+    
+    #create the start and count vectors for how much data we are going to select
+    start_vector <- c(lon_start, lat_start, 17, 1) #order is: long, lat, depth, time.
+    count_vector <- c(lon_count, lat_count, 1, 1) #we only want to vary long and lat and keep everything else consistent
+    
+    #get the specific variable and save it as a matrix
+    file_matrix <- var.get.nc(ncfile = server_file, variable = "TN",
+                              start = start_vector, count = count_vector)
+    
+    #close the connection to the file
+    close.nc(server_file)
+        
+    #calculate the extent based on the lat and long (xmin, ymin, xmax, ymax)
+    rast_extent <- ext(c(min(lon[lon_start]), min(lat[lat_start]),
+                       max(lon[lon_start+lon_count]), max(lat[lat_start+lat_count])), xy = T)
+        
+    #convert the matrix into a SpatRaster   
+    file_raster <- file_matrix |> terra::t() |> rast(extent = rast_extent, crs = proj_crs) |> flip("vertical")
+        
+    #update the time and name components of the raster
+    time(file_raster) <- date(glue("{i}-01"))
+    names(file_raster) <- glue("TN_{i}")
+    
+    #add the raster onto the main SpatRaster
+    tn <- c(tn, file_raster)
+  
+  }
+  
+  #save the rasters
+  writeCDF(tn, glue("{save_data}/tn.nc"), overwrite = T)
+  
+}
+
+```
+
+### Download Wind Data
+
+In this code chuck we download the wind vector data - this type of data is slightly different to other water quality measures. Where "normal" water quality data has a positional value and a variable value (e.g. pH), wind vector data has a positional value, a variable value (wind speed), and a directional value. This directional data requires another level of representation/storage. Another example of data like this is water current data. Therefore wind data is split into two components (the u and v components) that combine to form one dataset. My understanding is that:
+
+ - u = the east-west component (how fast is the wind moving east/west?)
+ - v = the north-south component (how fast is the wind moving north/south?)
+ 
+And by doing some vector maths we can work out the exact direction and velocity of the wind.
+
+This is a good case study of the more unique datasets that are available.
+
+```{r}
+#| label: Download eReefs wind vector data
+
+#first check if we have already downloaded the files we need
+if (file.exists(glue("{save_data}/ew_wind.nc")) & file.exists(glue("{save_data}/ns_wind.nc"))){
+  
+  ew_wind <- rast(glue("{save_data}/ew_wind.nc"))
+  names(ew_wind) <- rep("ew_wind", dim(ew_wind)[3])
+  ns_wind <- rast(glue("{save_data}/ns_wind.nc"))
+  names(ns_wind) <- rep("ns_wind", dim(ns_wind)[3])
+  
+  message("Files read from local storage.")
+  
+} else {
+
+  #build the prefix for the download link
+  file_prefix <- "https://thredds.ereefs.aims.gov.au/thredds/dodsC/s3://aims-ereefs-public-prod/derived/ncaggregate/ereefs/gbr1_2.0/monthly-monthly/EREEFS_AIMS-CSIRO_gbr1_2.0_hydro_monthly-monthly-"
+  
+  #create two empty rasters to store each set of downloaded data
+  ew_wind <- rast()
+  ns_wind <- rast()
+  
+  #create a vector of all the dates we want to download
+  date_vector <- sort(c(outer(2018:2018, sprintf(fmt = "%02d", 1:12), paste, sep = "-")))
+  
+  #create a vector of each of the variables we want to download
+  variables_vector <- c("wspeed_u", "wspeed_v")
+  
+  #create a vector of each of the variables names we want to assign
+  names_vector <- c("ew_wind", "ns_wind")
+  
+  
+  for (i in 1:length(variables_vector)){#for one variable at a time
+    for (j in date_vector){#run through every single date and download
+      
+      #open the connection to the file
+      file_path <- glue("{file_prefix}{j}.nc")
+      server_file <- open.nc(file_path)
+      
+      #read the lat and long of the file
+      lon <- var.get.nc(server_file, "longitude")
+      lat <- var.get.nc(server_file, "latitude")
+      
+      #determine the minimum and maximum indices for each of our lats and longs
+      lon_start <- which.min(abs(lon - st_bbox(n3_region)[1] + 0.1))
+      lat_start <- which.min(abs(lat - st_bbox(n3_region)[2] + 0.1))
+      lon_count <- which.min(abs(lon - st_bbox(n3_region)[3] - 0.1)) - lon_start
+      lat_count <- which.min(abs(lat - st_bbox(n3_region)[4] - 0.1)) - lat_start
+      
+      #create the start and count vectors for how much data we are going to select
+      start_vector <- c(lon_start, lat_start, 1) #order is: long, lat, time.
+      count_vector <- c(lon_count, lat_count, 1) #we only want to vary long and lat and keep everything else consistent
+      
+      #get the specific variable and save it as a matrix
+      file_matrix <- var.get.nc(ncfile = server_file, variable = variables_vector[i],
+                                start = start_vector, count = count_vector)
+      
+      #close the connection to the file
+      close.nc(server_file)
+      
+      #calculate the extent based on the lat and long
+      rast_extent <- ext(min(lon[lon_start]), min(lat[lat_start]),
+                         max(lon[lon_start+lon_count]), max(lat[lat_start+lat_count]), xy = T)
+      
+      #convert the matrix into a SpatRaster   
+      file_raster <- file_matrix |> terra::t() |> rast(extent = rast_extent, crs = proj_crs) |> flip("vertical")
+      
+      #update the time component of the raster
+      time(file_raster) <- date(glue("{j}-01"))
+      
+      #update the name component of the raster
+      names(file_raster) <- names_vector[i]
+      
+      #add the raster onto the correct main SpatRaster
+      if (variables_vector[i] == "wspeed_u"){ew_wind <- c(ew_wind, file_raster)}
+      else {ns_wind <- c(ns_wind, file_raster)}
+      
+    }
+    
+    #save each of the rasters
+    if (variables_vector[i] == "wspeed_u"){writeCDF(ew_wind, glue("{save_data}/ew_wind.nc"), overwrite = T)}
+    else {writeCDF(ns_wind, glue("{save_data}/ns_wind.nc"), overwrite = T)}
+    
+  }
+}
+
+#cleanup
+rm(date_vector, variables_vector, file_path, server_file, lon, lat, lon_start, lat_start, lon_count,
+   lat_count, start_vector, count_vector, file_matrix, rast_extent, file_raster)
+
+```
+
+# Wrangle Data
+
+Now all the data has been downloaded we can begin to manipulate and wrangle. Currently, because we are only downloading data for a single depth layer, datasets like TN don't require much work. The only major step is to cut the data specifically to the N3 regions. 
+
+```{r}
+#| label: cut data specifically to n3 regions
+
+#mask = replace values outside vect with NA, trim = remove NA
+n3_tn <- trim(mask(tn, vect(n3_region)))
+
+```
+
+However, for data such as wind data, or water currents, etc. we need to calculate the magnitude (direction and speed) of the wind as its own raster before we can crop.
+
+```{r}
+#| label: combine wind data into single raster
+
+#create a new empty raster to hold magnitude data
+wind_magnitude <- rast()
+
+#create a new empty raster to hold ew and ns raster layers in order
+ew_ns_rast <- rast()
+
+for (i in 1:dim(ew_wind)[3]){#for each of the layers (dates) in the raster
+  
+  #select the specific layer(date) from each raster and calculate a magnitude raster
+  mag_temp_rast <- lapp(c(ew_wind[[i]], ns_wind[[i]]), fun = function(x, y){sqrt(x^2 + y^2)})
+  
+  #add ew and ns layers in order (one ew, then one ns layer, then one ew, etc.).
+  ew_ns_rast <- c(ew_ns_rast, ew_wind[[i]], ns_wind[[i]])
+  
+  #combine the wind magnitude layers
+  wind_magnitude <- c(wind_magnitude, mag_temp_rast)
+
+}
+
+#update the time and name components of the magnitude raster
+time(wind_magnitude) <- time(ew_wind)
+names(wind_magnitude) <-  rep("Wind Mag", dim(wind_magnitude)[3])
+
+#cut to the n3 region
+n3_wind_magnitude <- trim(mask(wind_magnitude, vect(n3_region)))
+n3_ew_ns_rast <- trim(mask(wind_magnitude, vect(n3_region)))
+
+```
+
+Not that we can see much yet, but here is how each of these datasets look:
+
+```{r}
+#| label: plot each of the layers 2
+
+plot(n3_tn[[1]])
+
+```
+
+```{r}
+#| label: plot each of the layers 3
+
+plot(n3_wind_magnitude[[1]])
+
+```
+
+# Analyse Data
+
+Datasets are now as ready as they can be, here we begin the data analysis component, first by creating a "Key Table" (a table that contains all layer names, dates, and associated info (e.g. financial year)). We can then utilize this table to calculate some summary statistics including:
+
+ - The average value of a variable each month in each of the N3 offshore region.
+ - The average value of a variable for the financial year in each N3 offshore region.
+ - The min and max values of a variable.
+
+These statistics and/or the raw cell values are then used to calculate a score and grade for each variable.
+ 
+## Key Table
+
+Here we create the key table, note that this table is used through out as a referencing document. E.g., want all layers with the years 2015 to 2019? Use the key table to pull out the names of all layers within that range then you can use those names to select layers.
+
+```{r}
+#| label: creating key table
+
+#create a tibble of layer names and dates
+name_date <- tibble("layer_name" = names(n3_tn), "layer_date" = time(n3_tn))
+
+#add extra info (fyear, year, month, etc.)
+name_date_tbl <- name_date |> mutate(year = year(layer_date),
+                                     month = month(layer_date, label = T),
+                                     fyear = case_when(month(layer_date) > 6 ~ year + 1, T ~ year))
+
+```
+
+## Summary Table
+ 
+### Average Monthly Value
+
+Using the key table, the first on the list is to calculate a monthly value for each variable for each offshore zone in each of the regions. The code chunk below achieves this by using exactextract().
+
+:::{-callout.note}
+Currently we are only grabbing one of the variables to use as a test case.
+:::
+
+```{r}
+#| label: calculate monthly value
+
+for (i in c("n3_tn")){#for the list of variables
+  
+  #select only the offshore zone
+  n3_offshore <- n3_region |> filter(basin_or_zone == "Offshore")
+  
+  #get mean from all layers (make sure layers are monthly)
+  mean_region <- tibble(exact_extract(get(i), n3_offshore, fun = "mean", append_cols = T))
+  
+  #fix column names
+  names(mean_region) <- sub('mean.', '', names(mean_region))
+  
+  #add units
+  mean_region <- mean_region |> mutate(units = "mg N m-3", .after = "geographic_area")
+  
+  #pivot data, round values, then use left_join() to add time, year, mon, and fyear
+  mean_region <- pivot_longer(mean_region, cols = 7:ncol(mean_region),
+                              names_to = "layer_name", values_to = "monthly_mean") |> 
+    left_join(name_date_tbl, by = "layer_name")
+  
+  #assign data
+  assign(glue("{i}_monthly_tbl"), mean_region)
+  
+}
+
+```
+
+### Average Annual Value
+
+We can then piggyback off this to workout the financial year values.
+
+```{r}
+#| label: calculate annual value (financial year)
+
+#group by financial year and average
+summary_tbl <- n3_tn_monthly_tbl |> group_by(region, fyear) |> 
+  mutate(fyear_mean = mean(monthly_mean)) |> 
+  ungroup()
+
+```
+
+Then add min and max columns.
+
+```{r}
+#| label: adding min and max
+
+summary_tbl <- summary_tbl |> group_by(region, fyear) |> 
+  mutate(min = round(min(monthly_mean, na.rm = T),2),
+         max = round(max(monthly_mean, na.rm = T),2)) |> 
+  ungroup()
+
+```
+
+## Calculate Score and Grade
+
+With this summary table we now have the monthly and yearly mean values for the offshore zone in each region that can be assessed against the WQO for the zone. However before we can calculate this the units needs to be converted, currently eReefs data is provided in "mg N m-3", while the WQO is in ug/L. Conversion as I understand it is as follows:
+
+ - m-3 == 1000L
+ - mg == 1000ug
+ 
+Thus mg/m-3 == ug/L and the joke is on me as that means there is no conversion necessary, just a change in the presentation of the units. Noting that "N" is on both sides of the equation and does need to be dealt with.
+
+
+```{r}
+#| label: convert units
+
+summary_tbl <- summary_tbl |> mutate(units = "ug/L")
+
+```
+
+The offshore zone for each region will have its own WQO, but for now we will broadly use a dummy value of 100ug/L for testing purposes.
+
+:::{-callout.warning}
+To repeat above, currently we are using a dummy WQO value of 100ug/l for testing purposes. This will need to change in the future.
+:::
+
+```{r}
+#| label: add WQO values
+
+#add a dummy wqo value
+summary_tbl <- summary_tbl |> mutate(wqo = 100)
+
+```
+
+And now using the WQO (aka Guideline Value GV) we will cap the scores.
+
+```{r}
+#| label: cap values
+
+#cap the monthly mean values using the wqo value
+summary_tbl <- summary_tbl |> 
+  mutate(capped_value = case_when(log2(wqo/monthly_mean) <= -1 ~ -1,
+                                  log2(wqo/monthly_mean) >= 1 ~ 1,
+                                  T ~ log2(wqo/monthly_mean)))
+
+```
+
+Next we need to standardize the indicator and indicator category scores to the 0-100 scale.
+
+```{r}
+#| label: standardise scores
+
+#create a standardising function
+rounding_func <- function(col){
+  col = round(case_when(
+    col >= .51 ~ 100 - (19 - ((col-0.51) * (19/0.49))),
+    col >= 0 & col < .51 ~ 80.9 - (19.9 - ((col -0.01) *(19.9/0.49))),
+    col >= -.33 & col < -.01 ~ 60.9- (19.9 - ((col -(-0.33)) *(19.9/0.32))),
+    col >= -.66 & col < -.34 ~ 40.9- (19.9 - ((col -(-0.66)) * (19.9/0.32))),
+    TRUE ~ 20.9- (20.9 - ((col -(-1)) *(20.9/0.34)))))
+}
+
+#run function on column 
+summary_tbl$standardised_value <- rounding_func(summary_tbl$capped_value)
+  
+```
+
+And for now, this is all we will do for the summary table. Below we save.
+
+```{r}
+#| label: save summary table
+
+#save to the main output folder
+write_csv(summary_tbl, glue("{save_path}/tn_summary.csv"))
+
+```
+
+
+# Visualise Data
+
+After calculating the required statistics well will create some visualizations to help with interpretation. In the section below we will create:
+
+ - Line plots for monthly data for each region (with WQO values)
+ - Maps of monthly data for each region
+ - Maps of annual data for each region
+ - TBA
+ 
+## Line Plots
+
+First up is the line plots.
+
+```{r}
+#| label: create line plots
+
+ggplot(summary_tbl) +
+  geom_line(aes(x = month, y = monthly_mean, group = region, colour = region))
+
+```
+
+## Maps
+
+Then some basic maps
+
+```{r}
+#| label: cut data to each region
+
+#get a list of unique regions
+n3_regions <- unique(n3_basins$region)
+
+#recraft region names for save paths
+n3_save_paths <- tolower(str_replace_all(n3_regions, " ", "_"))
+
+for (i in 1:length(n3_regions)){
+  
+  #create an sf of the region for st_bbox later
+  n3_bounding_region <- filter(n3_basins, region == n3_regions[i])
+  
+  #cut data to region for each
+  test_region <- trim(mask(test_all, vect(filter(n3_basins, region == n3_regions[i]))))
+  wind_mag_region <- trim(mask(wind_magnitude, vect(filter(n3_basins, region == n3_regions[i]))))
+  
+  #then convert to a dataframe
+  vector_field_df_regional <- as.data.frame(aggregate(test_region, fact = 35, fun = "mean"), xy = T)
+  
+  #begin plotting loop
+  
+  #get the min and max values for the magnitude data
+  min_val <- min(minmax(wind_mag_region))
+  max_val <- max(minmax(wind_mag_region))
+  
+  for (j in 1:dim(wind_mag_region)[3]){#for each layer in the spat raster
+    
+    #get the column index starting at 3 and 4 and iterating up each loop
+    u_component <- 2 + j
+    v_component <- 3 + j
+    
+    #select the correct u and v rows from the dataframe to match the spatraster
+    one_map_vect_field <- vector_field_df_regional |> select(x, y, all_of(u_component), all_of(v_component))
+    
+    #plot
+    map <- ggplot() +
+      geom_spatraster(data = wind_mag_region[[j]]) +
+      scale_fill_gradientn(colours = c(rev(brewer.pal(n = 11, "RdYlBu"))), na.value = "transparent", 
+                           labels = scales::label_number(suffix = "m/s"),
+                           limits = c(min_val, max_val),
+                           breaks = seq(0, 10, 2)) +
+      labs(fill = "Wind Magnitude") +
+      geom_quiver(data = one_map_vect_field, aes(x = x, y = y, u = ew_wind, v = ns_wind), center = F, rescale = F,
+                  vecsize = 1, colour = "grey25") +
+      geom_sf(data = qld, colour = "Black") + 
+      geom_sf(data = n3_basins, colour = "Black", fill = NA, lwd = 0.4) +
+      coord_sf(xlim = c(st_bbox(n3_bounding_region)[1], st_bbox(n3_bounding_region)[3]),
+               ylim = c(st_bbox(n3_bounding_region)[2], st_bbox(n3_bounding_region)[4]),
+               expand = F) +
+      theme(panel.background = element_blank(),
+            panel.border = element_rect(colour = "Black", fill = NA),
+            axis.title = element_blank(),
+            axis.ticks = element_blank(),
+            axis.text = element_blank(),
+            legend.key.size = unit(1, "cm"),
+            legend.text = element_text(size = 15),
+            legend.title = element_text(size = 20))
+    
+    #save
+    ggsave(glue("{save_path}/{n3_save_paths[i]}/{n3_save_paths[i]}_wind-magnitude_map_{j}.png"), map, dpi = 72,
+          width = 10, height = 10)
+  }
+}
+
+```
+
+# Session Info {#sec-sessioninfo}
+
+Below is the session info at the time of rendering this script. Of greatest importance is to note the R version, and the "other attached packages" as these are the most significant drivers of success/failure. It is also good to check the "attached base packages" and "loaded via a namespace" packages as well. To check your session info use `sessionInfo()`.
+
+```{r}
+#| label: show session info
+
+sessionInfo()
+
+```
+
+
+
+
+

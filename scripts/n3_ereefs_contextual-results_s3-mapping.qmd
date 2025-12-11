@@ -1,0 +1,812 @@
+---
+title: "eReefs Contextual Results - Mapping"
+subtitle: "A Healthy Waters Partnership Analysis"
+description: "This script has been written to create a series of contextual results to be included in the Offshore Marine Zone of the Technical Report."
+author: "Adam Shand" 
+format: html
+params:
+  project_crs: "EPSG:7844"
+  target_fyear: 2023
+  target_region: "Dry Tropics"
+  resolution: 0 #0 is full size, bigger number = more cells merge together
+  buffer: 1.2 #how much "extra" of the model do we want to get outside of the focus area
+---
+
+::: {.callout-note}
+This is one part of several scripts exploring CSIRO ereefs data. 
+:::
+
+# Introduction
+
+The objective of this script is to produce contextual maps of a variety of eReefs variables. The maps produced are as follows:
+
+ - Monthly mean maps
+ - Annual mean maps
+
+ Within these two types of maps, there are two variations. Variation 1 is the "standard" raster map, with colour associated with concentration/amount. Variation 2 is a vector field map specifically designed to represent wind direction and magnitude, these will also include a standard raster map in the background.
+
+ The user defines a series of inputs to control how many total maps are created, and the length of time that is plotted. The user can control:
+
+  - The number of regions to plot
+  - The number of variables to plot
+  - The length of time to plot
+
+For example, the user could request:
+
+ 1. A single year of chlorophyll a data in the Dry Tropics region, resulting in:
+    - One annual map, and one 12-month faceted map
+ 2. A 3-year span of chlorophyll a, turbidity, and Wind, in both the Dry Tropics Region, and the Wet Tropics Region, resulting in:
+    - 12 annual maps (6x DT (1 per year per variable, 6x WT),
+    - 12, 12-month faceted maps,
+    - 6 annual vector field maps (3x DT (1 per year), 3x WT), and
+    - 6, 12-month faceted maps
+
+This control is achieved by suppling the following inputs:
+
+ - Region(s)
+ - Financial Year(s)
+ - Variable(s)
+
+However, the user must also supply the following inputs related to the resolution and extent of the data, these inputs define what data is selected for plotting:
+
+ - Downsample (in reference to the resolution of the data)
+ - Buffer (in reference to any addtional extent around the region)
+ - Wideview (in reference to how far out the "camera" sits, works in combination with Buffer)
+
+ The user must supply **at least one of each**, however could choosen to provide several. The following cheatsheet has been supplied for common inputs:
+
+| Input      | Full Names/Context                                                        | Text to Supply To Script                                  |
+| ---------- | ------------------------------------------------------------------------- | --------------------------------------------------------- |
+| Region     | Dry Tropics, Wet Tropics, Burdekin, Mackay Whitsunday Issac               | DT, WT, BD, MWI                                           |
+| FYear      | 2019-20, 2020-21, 2021-22, 2022-23, 2023-24                               | 2020, 2021, 2022, 2023, 2024                              |
+| Variable   | Turbidity, Chlorophyll a, DIN, Ammonium, Nitrate, Secchi Depth, pH, Wind  | Turbidity, Chlorophyll a, DIN, NH4, NO3, Secchi, pH, Wind |
+| Downsample | 0-10, integer (no decimal), increasing by 1 each time                     | 0 - 10*                                                   |
+| Buffer     | Yes, No                                                                   | Y, N**                                                    |
+| Wideview   | Yes, No                                                                   | Y, N***                                                   |
+
+* Downsample indicates the amount cell aggregation, with 0 being 0 cells aggregated and 10 being 10 cells in each direction combined into a single cell.
+** Buffer indicates the additional extent outside the region to the edge of the maps, Yes means include this extra area, No means do not.
+*** Wideview indicates if the camera should perfectly border the region or the data. Yes means border the data, no means border the region.
+
+The data associated with the exact combination of region, financial year, variable, downsample, and buffer must be present on the local machine for the plot to be created.
+
+# Script Set Up
+
+This script requires multiple core spatial packages, each of which is loaded below. Key variables and paths are also created.
+
+```{r}
+#| label: load packages
+
+#use pacman function to load and install (if required) all other packages
+pacman::p_load(tidyverse, glue, here, tmap, sf, stars, metR, ggplot2, oce, rcartocolor, akima)
+
+#build data and output path manually (it is just easier in this case)
+data_path <- here("data/02. northern_three/n3_ereefs_contextual-results/")
+output_path <- here("outputs/02. northern_three/n3_ereefs_contextual-results/maps/")
+dir.create(output_path)
+
+#turn off spherical geometry
+sf_use_s2(FALSE)
+
+#turn off scientific notation
+options(scipen = 999)
+
+```
+
+# Load Data
+
+This script uses data produced by script 1, if the dataset you wish to plot is not found in the local folder, return to script 1.
+
+ ## Verify User Inputs
+
+First, the user inputs are verified:
+
+```{r}
+
+#manually enter user inputs to begin with for testing:
+u_in <- list(
+  u_in_reg = c("MWI"),
+  u_in_year = c(2020),#, 2021, 2022, 2023, 2024),
+  u_in_var = c("Turbidity", #"Chlorophyll a", "DIN"), 
+  #"NH4", "NO3", "Secchi", "pH", 
+  "Wind"),
+  u_in_ds <- 0,
+  u_in_bf <- "N")
+
+#name each item in the list
+names(u_in) <- c("Region", "FYear", "Variable", "Downsample", "Buffer")
+
+#build vectors of supported inputs
+u_in_supported <- list(
+  reg_supported = c("DT", "WT", "BD", "MWI"),
+  fyear_supported = c(2020, 2021, 2022, 2023, 2024),
+  var_supported = c("Turbidity", "Chlorophyll a", "DIN", "NH4", "NO3", "Secchi", "pH", "Wind"),
+  ds_supported = seq(0,10,1),
+  bf_supported = c("Y", "N"))
+
+#name each item in the list
+names(u_in_supported) <- c("Region", "FYear", "Variable", "Downsample", "Buffer")
+
+#for each item in the two lists, compare and record differences
+compare_inputs <- map2(u_in, u_in_supported, setdiff)
+
+#remove any instances where there are no differences
+compare_inputs <- flatten(compare_inputs)
+
+#flag all instances where there are differences and warn the user
+if (length(compare_inputs) > 0){
+  for (i in 1:length(compare_inputs)){
+
+    wrong_input <- compare_inputs[[i]]
+
+    input_type <- str_to_lower(names(compare_inputs[i]))
+
+    input_options <- paste(u_in_supported[[names(compare_inputs[i])]], collapse = ", ")
+
+    stop(glue('The "{wrong_input}" {input_type} input is not currently supported, try one of: "{input_options}"'))
+  }
+} else {print("All user inputs supported.")}
+
+```
+
+## Expand Variable Inputs
+
+If the user has requested "wind" this relates to four variables:
+
+```{r}
+
+#if wind requested
+if (any(str_detect(u_in[["Variable"]], "Wind"))){
+
+  #update the variable inputs
+  u_in[["Variable"]] <- c(
+    str_replace(u_in[["Variable"]], "Wind", "Wind Direction"),
+    "Wind Stress",
+    "Wind U Component",
+    "Wind V Component")
+}
+
+```
+
+## Open Local Datasets
+
+Then the data is confirmed to be on the local machine, and loaded in:
+
+```{r}
+
+#create a table that tracks all user inputs.
+all_user_inputs <- expand.grid(u_in, stringsAsFactors = F)
+
+#using the same user inputs df
+requested_data <- pmap(all_user_inputs, \(Region, FYear, Variable, Downsample, Buffer) {
+
+  #create a filename using the human readable variable names
+  file_name <- str_to_lower(
+    str_replace_all(
+      string = glue("{Region}_{FYear}_{Variable}_ds-{Downsample}_bf-{Buffer}"),
+      pattern = " ",
+      replacement = "-"
+    )
+  )
+
+  #if exists, load it in
+  if (any(file.exists(glue("{data_path}/{file_name}.{c('nc', 'RData')}")))){
+    if (Region == "MWI"){data <- readRDS(glue("{data_path}/{file_name}.RData"))}
+    if (Region != "MWI"){data <- read_mdim(glue("{data_path}/{file_name}.nc"))}
+  } else {stop(glue("The {file_name} file does not exist, return to script 1."))}
+
+  #return the datafile as the final output of the map function
+  return(data)
+
+})
+
+#extract the name of each file
+item_names <- pmap(all_user_inputs, \(Region, FYear, Variable, Downsample, Buffer){
+  str_to_lower(
+    str_replace_all(
+      string = glue("{Region}_{FYear}_{Variable}_ds-{Downsample}_bf-{Buffer}"),
+      pattern = " ",
+      replacement = "-"
+    )
+  )
+})
+
+#rename items in the data list
+names(requested_data) <- item_names
+
+```
+
+## Load Visual Resources
+
+Before mapping, some additional visual resources need to be loaded in:
+
+```{r}
+
+#load in the n3 region
+n3_region <- st_read(here("outputs/01. core/n3_prep_region-builder/n3_region.gpkg"))
+
+#create a list of region sf datasets based on the users input
+regions_selected_by_user <- map(u_in[["Region"]], function(x){
+
+  #translate User Input
+  region_key <- c(
+    "DT" = "Dry Tropics",
+    "WT" = "Wet Tropics",
+    "BD" = "Burdekin",
+    "MWI" = "Mackay Whitsunday Isaac"
+  )
+  
+  #filter the data to select the region(s) requested by the user
+  selected_region <- n3_region |> 
+    filter(Region %in% unname(region_key[x]))
+
+  #create a sf dataset of just the land parts associated with the region(s)
+  selected_land_region <- selected_region |> 
+    filter(Environment != "Marine") |> 
+    group_by(Region, SubBasinOrSubZone) |> 
+    summarise(geometry = st_union(geom)) |> 
+    ungroup() |> st_cast() |> 
+    st_make_valid()
+
+  #create a sf dataset of just the water parts associated with the region(s)
+  selected_marine_region <- selected_region |> 
+      filter(Environment == "Marine") |> 
+    group_by(Region, SubBasinOrSubZone) |> 
+    summarise(geometry = st_union(geom)) |> 
+    ungroup() |> st_cast() |> 
+    st_make_valid()
+
+  #wrap up these two objects into the one list output
+  selected_region <- list(
+    "Land" = selected_land_region,
+    "Marine" = selected_marine_region)
+
+  #return the df as the final output (these will be wrapped up in a list)
+  return(selected_region)
+})
+
+#add names to each item in the list to help track
+names(regions_selected_by_user) <- u_in[["Region"]]
+
+#load a Queensland outline from the aims package
+qld <- get(data("gbr_feat", package = "gisaimsr")) |> 
+  filter(FEAT_NAME %in% c("Mainland", "Island")) |> 
+  st_transform("EPSG:7844")
+
+#read in reef data from the aims package
+reefs <- get(data("gbr_feat", package = "gisaimsr")) |> 
+  filter(FEAT_NAME == "Reef") |> 
+  st_transform("EPSG:7844")
+
+```
+
+# Prepare Data
+
+Both the monthly and annual layers needs to be calculated:
+
+## Monthly Layers
+
+Monthly mean layers take a bit of work to calculate:
+
+```{r}
+
+#write a custom function that does each of the required steps to calculate the monthly values
+monthly_mean_data <- map(requested_data, function(dataset){
+  
+  #get the list of "times" (dates) stored in the dataset (1 date per layer) and convert it into a dataframe
+  dates <- data.frame(DateTime = st_get_dimension_values(dataset, which = "time"))
+  
+  #extract the year and month and combine into a single unique name and add an index column
+  dates <- dates |> 
+    mutate(Year = year(DateTime),
+           Month = month(DateTime, label = T),
+           RowId = row_number()) |> 
+    unite(LayerName, "Year", "Month", sep = "_")
+  
+  #group by LayerName and get the min and max row index (layer number) for each month, then reorder the dataframe by index
+  dates <- dates |> 
+    group_by(LayerName) |> 
+    summarise(MinIndex = min(RowId),
+              MaxIndex = max(RowId)) |> 
+    arrange(MinIndex)
+  
+  #create a trackers for the objects that will be made
+  created_objects <- c()
+  
+  #loop over each of the unique names
+  for (i in unique(dates$LayerName)){
+  
+    #get the index numbers for the min and max layers from the table
+    min_layer <- dates |> filter(LayerName == i) |> select(MinIndex) |> as.numeric()
+    max_layer <- dates |> filter(LayerName == i) |> select(MaxIndex) |> as.numeric()
+    
+    #extract the month of data using the index numbers 
+    monthly_mean <- dataset[,,,min_layer:max_layer]
+    
+    #and apply the mean function over the i,j dimensions (lat, long)
+    monthly_mean <- st_apply(monthly_mean, 1:2, FUN = mean, keep = TRUE)
+    
+    #assign the monthly_mean dataset to a new object
+    assign(glue("{i}"), monthly_mean)
+    
+    #create a vector that tracks all the names of the created objects
+    created_objects <- c(created_objects, glue("{i}"))
+  
+  }
+  
+  #combine each of the monthly layers into one new dataset ("mget" is "multiple get")
+  dataset_monthly <- do.call(c, mget(created_objects))
+
+  #convert the multiple attributes into multiple (time) layers
+  dataset_monthly <- st_redimension(
+    x = dataset_monthly, 
+    new_dims = st_dimensions(dataset_monthly), 
+    along = setNames(list(names(dataset_monthly)), "time"))
+
+  #update the names of the attribute
+  names(dataset_monthly) <- names(dataset)
+
+  #return the final object
+  return(dataset_monthly)
+  
+})
+
+```
+
+## Annual Layers
+
+However, annual layers are much more straight forward:
+
+```{r}
+
+#calculate annual layers
+annual_mean_data <- map(requested_data, \(x) {
+
+  #apply the mean function over each of the datasets in the list
+  annual_mean <- st_apply(x, 1:2, FUN = mean, keep = TRUE)
+
+})
+
+```
+
+## Separate Wind Data
+
+If the user has requested wind data this requires its own set of maps, thus the data needs to be separated:
+
+```{r}
+
+#check if any wind datasets are present
+if (any(str_detect(names(monthly_mean_data), "wind"))){
+
+  #return a T/F index for if the object is wind
+  is_wind <- str_detect(names(monthly_mean_data), "wind")
+
+  #pull out the wind datasets from the original into a new copy
+  monthly_mean_wind <- monthly_mean_data[c(is_wind)]
+  annual_mean_wind <- annual_mean_data[c(is_wind)]
+
+  #delete the wind datasets from the original
+  monthly_mean_data <- monthly_mean_data[!c(is_wind)]
+  annual_mean_data <- annual_mean_data[!c(is_wind)]
+}
+
+```
+
+## Build Colour Palettes
+
+Each variable should have its own colour palette:
+
+```{r}
+
+#install.packages("rcartocolor")
+
+#build a colour key for reference during mapping, if the name matches (during mapping) the associated palette is used.
+colour_key <- list( 
+  "Turbidity"      = oce::oceColorsTurbidity(9),
+  "Chlorophyll a"  = oce::oceColorsChlorophyll(9),
+  "DIN"            = RColorBrewer::brewer.pal(9, "Blues"),
+  "NH4"            = rcartocolor::carto_pal(9, "ag_GrnYl"),
+  "NO3"            = rcartocolor::carto_pal(9, "Sunset"),
+  "Secchi"         = RColorBrewer::brewer.pal(9, "OrRd"),
+  "pH"             = RColorBrewer::brewer.pal(9, "RdBu"),
+  "Wind"           = oce::oceColorsVelocity(9)
+)
+
+#build a wrapper around this that handles partial matches
+get_colour_palette <- function(var_name, palette_list){
+
+  #do any of the names match the requested variable? returns a T/F vector
+  matches <- str_detect(var_name,  names(colour_key))
+
+  #return associated palette
+  return(colour_key[matches][[1]])
+  
+}
+
+```
+
+# Map Data
+
+## Concentration Maps
+
+The first series of maps created are the "concentration" maps, these are for variables such as chlorophyll, secchi depth, DIN, etc. that are measured as a concentration value.
+
+Both the monthly and annual maps share the same styling, differentiated only by being faceted. Thus, they can be efficently combined into a single loop:
+
+```{r}
+
+#if the list of datasets is empty, skip the code
+if (length(monthly_mean_data) != 0){
+
+  #for each sf dataframe in our list
+  for (i in 1:length(monthly_mean_data)){
+
+    #determine the region that is being mapped by pulling the name out of the raster
+    region_being_mapped <- str_to_upper(str_extract(names(monthly_mean_data)[i], ".{2,3}(?=_)"))
+
+    #then using this to retrieve the land and marine datasets associated with the name
+    region_land <- regions_selected_by_user[[region_being_mapped]][["Land"]]
+    region_marine <- regions_selected_by_user[[region_being_mapped]][["Marine"]]
+
+    #mask reefs to the region we are currently looking at
+    target_reefs <- st_intersection(reefs, st_union(region_marine))
+
+    #obtain a boundary box for the extend of the data we are going to look at
+    data_bbox <- region_marine |> 
+      st_buffer(1) |> 
+      st_bbox() |> 
+      st_transform("EPSG:7855")
+
+    #update the crs on each
+    region_land <- region_land |> st_transform("EPSG:7855")
+    region_marine <- region_marine |> st_transform("EPSG:7855")
+    
+    #use the bounding box to crop our other visual resources
+    all_reefs <- reefs |> st_transform("EPSG:7855") |> st_crop(data_bbox)
+    reefs_in <- reefs |> st_transform("EPSG:7855") |> st_intersection(region_marine)
+
+    #do the same for the queensland backdrop
+    qld_cropped <- qld |> st_transform("EPSG:7855") |> st_crop(data_bbox)
+
+    #if the region is MWI we need to swap the crs back to 4326
+    if (region_being_mapped == "MWI"){
+
+      qld_cropped <- qld_cropped |> st_transform("EPSG:4326")
+      region_land <- region_land |> st_transform("EPSG:4326")
+      all_reefs <- all_reefs |> st_transform("EPSG:4326")
+      reefs_in <- reefs_in |> st_transform("EPSG:4326")
+      region_marine <- region_marine |> st_transform("EPSG:4326")
+
+    }
+
+    #build a list that holds the monthly and annual datasets for the loop
+    data_list <- list(monthly_mean_data[[i]], annual_mean_data[[i]])
+    data_names <- c(names(monthly_mean_data)[i], names(monthly_mean_data)[i])
+    data_type <- c("monthly", "annual")
+    data_years <- str_extract(names(monthly_mean_data)[[i]], "\\d{4}")
+
+    #create the pair of maps
+    test_map <- pmap(list(data_list, data_names, data_type, data_years), \(data, names, type, year) {
+    
+      #start the map
+      map <- tm_shape(qld_cropped) +
+        tm_polygons(fill = "#99B5B1",
+                    col = "#7bba9d") +
+        tm_shape(region_land) +
+        tm_polygons(fill = "grey90", 
+                    col = "black") +
+        tm_shape(data) +
+        tm_raster(col = names(data),
+                  col.scale = 
+                    if (str_detect("ph", names)){
+                      tm_scale_continuous(
+                        values = get_colour_palette(names(monthly_mean_data[[i]])),
+                        n = 6)
+                    } else {
+                      tm_scale_continuous_log10(
+                        values = get_colour_palette(names(monthly_mean_data[[i]])),
+                        n = 6)
+                    },
+                  col.legend = tm_legend(reverse = TRUE,
+                                        title = names(data),
+                                        na.show = FALSE))
+                                        
+      #if the map is monthly, add a facet
+      if (type == "monthly") {map <- map + tm_facets(nrow = if(region_being_mapped != "WT"){3}else{2})}
+      
+      #finish the map
+      map <- map +
+        tm_shape(all_reefs) +
+        tm_borders(fill = "grey60",
+                  fill_alpha = 0.2,
+                  col = "grey60",
+                  col_alpha = 0.4) +
+        tm_shape(reefs_in) +
+        tm_borders(fill = "grey60",
+                  fill_alpha = 0.2,
+                  col = "black",
+                  col_alpha = 0.5) +
+        tm_shape(region_marine) +
+        tm_borders(col = "black") +
+        tm_shape(st_buffer(region_marine, 0.5), is.main = T) + 
+        tm_borders(col = NULL,
+                  fill = NULL) +
+        tm_layout(bg.color = "#C1DEEA",
+                  legend.position = tm_pos_out("right", "center"))
+      
+      #and save
+      tmap_save(map, glue("{output_path}/{names}_{type}_{year}.png"))
+
+    })   
+  }
+}
+
+```
+
+## Vector Field Maps
+
+The second set of maps are the vector field maps. These are a bit more challenging to create as they require the use of a different couple of packages (ggplot2 and metR).
+
+The biggest challenge here is that maps require two stars objects per map. Thus a list of 2 equals 1 map, a list of 4 equals 2 maps, etc. This has a notable influence on the looped code and you may find the logic difficult to follow at first. There are extra comments dividing the loop into sections. Once again, monthly and annual maps share the same styling and are compressed into the one loop:
+
+```{r}
+
+#if the list of datasets is empty, skip the code
+if (exists("monthly_mean_wind")){
+
+  #get all names (this includes both list name, and stars object name)
+  all_names <- map(monthly_mean_wind, names)
+
+  #get just the stars object name, and convert to a T/F vector based on this name
+  data_to_keep <- str_detect(unlist(all_names, use.names = F), "Direction|Stress", negate = TRUE)
+
+  #filter data in both the monthly data and annual data
+  monthly_mean_wind <- monthly_mean_wind[data_to_keep]
+  annual_mean_wind <- annual_mean_wind[data_to_keep]
+
+  #order data alphabetically to ensure consistency of method
+  monthly_mean_wind <- monthly_mean_wind[order(names(monthly_mean_wind))]
+  annual_mean_wind <- annual_mean_wind[order(names(annual_mean_wind))]
+
+  #determine the number of stars objects in the list
+  num_of_ob <- length(monthly_mean_wind)
+
+  #for half the length of the list, loop the following code
+  for (i in seq(from = 1, to = num_of_ob, by = 2)){
+
+    #-------
+    #Code to prep the wind data
+    #-------
+
+    #create two points for each dataset to retrieve, due to sorting they will always be adjacent, "i" has already been created
+    j <- i + 1
+
+    #build list that holds the monthly and annual datasets for the loop
+    #extract the u dataset - which correlates to "i", and the associated v dataset - which correlates to "j"
+    u_data_list <- list(monthly_mean_wind[[i]], annual_mean_wind[[i]])
+    v_data_list <- list(monthly_mean_wind[[j]], annual_mean_wind[[j]])
+    data_names <- rep(str_replace(names(monthly_mean_wind)[i], "_wind-u-component", ""), 2)
+    data_type <- c("monthly", "annual")
+    data_year <- str_extract(data_names, "\\d{4}")
+
+    #vector fields need to be provided in tabular form, convert the data to an sf object
+    u_data_list <- map(u_data_list, \(x) {st_as_sf(x, as_points = T, merge = F)})
+    v_data_list <- map(v_data_list, \(x) {st_as_sf(x, as_points = T, merge = F)})
+
+    #convert the geometry column into specific lat and lon columns, u and v share the same coordinates so this is only done once
+    u_data_list <- map(u_data_list, \(x) {
+      x$lon <- st_coordinates(x$geometry)[, "X"]
+      return(x)})
+    u_data_list <- map(u_data_list, \(x) {
+      x$lat <- st_coordinates(x$geometry)[, "Y"]
+      return(x)})
+
+    #the geometry column is no longer needed
+    u_data_list <- map(u_data_list, st_drop_geometry)
+    v_data_list <- map(v_data_list, st_drop_geometry)
+
+    #data is then pivoted longer such that all observations share one column
+    u_data_list <- map(u_data_list, \(x) { 
+      
+      if (ncol(x) > 3) { 
+        pivot_longer(x, cols = -matches("lon|lat"), names_to = "Month", values_to = "u") 
+      } else {rename(x, "u" = 1)}
+    })
+
+    v_data_list <- map(v_data_list, \(x) { 
+      
+      if (ncol(x) > 3) { 
+        pivot_longer(x, cols = -matches("lon|lat"), names_to = "Month", values_to = "v") |> 
+          select(!Month)
+      } else {rename(x, "v" = 1)}
+    })
+
+    #the u and v columns can then be combined into a single tabular dataset
+    u_v_data_list <- map2(u_data_list, v_data_list, bind_cols)
+
+    #velocity (directionless magnitude) can then be calculated based off these values
+    u_v_data_list <- map(u_v_data_list, \(x) { mutate(x, vel = round(sqrt(u^2 + v^2), 4)) })
+
+    #quadruple u and v component (after velocity calculations) to make the arrows a bit more obvious
+    u_v_data_list <- map(u_v_data_list, \(x) { mutate(x, u = u*4, v = v*4) })
+
+    #-------
+    #Code to prep other visual resources
+    #-------
+
+    #determine the region that is being mapped by pulling the name out of the raster
+    region_being_mapped <- str_to_upper(str_extract(names(monthly_mean_wind)[i], ".{2,3}(?=_)"))
+
+    #get two bboxs of the data. bbox one sits quite far out and crops supporting data, view two is a bit closer and defines the camera perspective
+    intermediate <- regions_selected_by_user[[region_being_mapped]][["Marine"]] |> 
+      st_union() |> 
+      nngeo::st_remove_holes() |> 
+      st_make_valid()
+    
+    data_bbox <- intermediate |> 
+      st_buffer(1) |> 
+      st_bbox() |> 
+      st_transform("EPSG:7855")
+
+    region_view <- intermediate |> 
+      st_buffer(0.5) |> 
+      st_bbox() |> 
+      st_transform("EPSG:7855")
+
+    #use the name to obtain the land and marine shapefiles associated with the region being mapped
+    region_land <- regions_selected_by_user[[region_being_mapped]][["Land"]] |> st_transform("EPSG:7855")
+    region_marine <- regions_selected_by_user[[region_being_mapped]][["Marine"]] |> st_transform("EPSG:7855")
+
+    #use the bounding box to crop our other visual resources
+    all_reefs <- reefs |> st_transform("EPSG:7855") |> st_crop(data_bbox)
+    reefs_in <- reefs |> st_transform("EPSG:7855") |> st_intersection(region_marine)
+
+    #do the same for the queensland backdrop
+    qld_cropped <- qld |> st_transform("EPSG:7855") |> st_crop(data_bbox)
+
+    #if the region is MWI we need to swap the crs back to 4326 (this is because the data crosses several projects so we cant use a single meter projection)
+    if (region_being_mapped == "MWI"){
+
+      qld_cropped <- qld_cropped |> st_transform("EPSG:4326")
+      region_land <- region_land |> st_transform("EPSG:4326")
+      all_reefs <- all_reefs |> st_transform("EPSG:4326")
+      reefs_in <- reefs_in |> st_transform("EPSG:4326")
+      region_marine <- region_marine |> st_transform("EPSG:4326")
+      region_view <- region_view |> st_transform("EPSG:4326")
+
+    }
+
+    #-------
+    #Code to create the maps
+    #-------
+
+    #create the pair of maps
+    test_map <- pmap(list(u_v_data_list, data_names, data_type, data_year), \(data, names, type, year) {
+
+      if (type == "monthly") {skip_val <- 12} else {skip_val <- 8}
+
+      if (region_being_mapped == "MWI"){
+        #this section occurs because the MWI data cannot be placed on to a project crs, and cannot be transformed to a regular grid.
+        #this is not an issue for the rest of the maps, but for the contour lines in the background of this plot, the functions requires a regular grid
+        #to do this we transform the data in post using the akima package. Warning - this takes a long time. Monthly data must be transformed 
+        #per month, annual data can be done once.
+
+        if (type == "monthly"){
+
+          #build the month by month interpolation function
+          interpolate_months <- function(df, month_name) {
+
+            #filter for a specific month
+            month_data_old <- filter(df, Month == month_name)
+
+            print("Processing...")
+
+            #calculate the values
+            vel_interp <- with(month_data_old, interp(x = lon, y = lat, z = vel, duplicate = "mean"))
+            u_interp <- with(month_data_old, interp(x = lon, y = lat, z = u, duplicate = "mean"))
+            v_interp <- with(month_data_old, interp(x = lon, y = lat, z = v, duplicate = "mean"))
+
+            print("Month n processed...")
+            
+            #build the new dataframe
+            month_data_new <- expand.grid(lon = vel_interp$x, lat = vel_interp$y)
+
+            #include the extra bells and whistles
+            month_data_new <- month_data_new |> 
+              mutate(
+                vel = as.vector(vel_interp$z),
+                u = as.vector(u_interp$z),
+                v = as.vector(v_interp$z),
+                Month = month_name) |> 
+              na.omit()
+
+            return(month_data_new)
+
+          }
+
+          #run the function (use a map to run it once per month)
+          monthly_data <- map(unique(data$Month), \(x) interpolate_months(data, x))
+
+          #each df then needs to be unlisted and stacked
+          data <- list_rbind(monthly_data)
+
+        } else {#otherwise, if the data is annual we can just run the interpolation directly
+
+          #calculate the values
+          vel_interp <- with(data, interp(x = lon, y = lat, z = vel, duplicate = "mean"))
+          u_interp <- with(data, interp(x = lon, y = lat, z = u, duplicate = "mean"))
+          v_interp <- with(data, interp(x = lon, y = lat, z = v, duplicate = "mean"))
+
+          #build the new dataframe
+          data <- expand.grid(lon = vel_interp$x, lat = vel_interp$y)
+
+          #include the extra bells and whistles
+          data <- data |> 
+              mutate(
+                vel = as.vector(vel_interp$z),
+                u = as.vector(u_interp$z),
+                v = as.vector(v_interp$z)) |> 
+              na.omit()
+        }
+      }
+      #start the map
+      vector_field_map <- 
+        ggplot() +
+        metR::geom_contour_fill(
+          data = data, 
+          aes(x = lon, y = lat, z = vel), 
+          na.fill = F, bins = 70
+        ) +
+        metR::geom_vector(
+          data = data, 
+          aes(x = lon, y = lat, dx = u, dy = v), 
+          arrow.angle = 30, arrow.type = "open", skip = skip_val - u_in[["Downsample"]], 
+          arrow.length = 0.4, pivot = 0, preserve.dir = TRUE, direction = "ccw"
+        ) +
+        scale_fill_gradientn(
+          name = "Stress (Nm-2)",
+          colours = get_colour_palette(names(monthly_mean_wind[[i]])),
+          limits = c(min(data$vel), max(data$vel)),
+          breaks = seq(min(data$vel), max(data$vel), length.out = 3)
+        )
+
+      #if monthly, facet the data
+      if (type == "monthly") { vector_field_map <- vector_field_map + facet_wrap(~Month) }
+
+      #finish the map
+      vector_field_map <- vector_field_map +
+        geom_sf(data = qld_cropped, fill = "#99B5B1", col = "#7bba9d") +
+        geom_sf(data = region_land, fill = "grey90", col = "black") +
+        geom_sf(data = all_reefs, fill = "#99999940", col = "#99999940") +
+        geom_sf(data = reefs_in, fill = "#99999940", col = "#00000050") +
+        geom_sf(data = region_marine, fill = NA, col = "black") +
+        coord_sf(
+          xlim = c(region_view["xmin"], region_view["xmax"]),
+          ylim = c(region_view["ymin"], region_view["ymax"])) +
+        theme(
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_blank(),
+          panel.background = element_rect(fill = "#C1DEEA", colour = NA),
+          panel.grid = element_blank()     
+        )
+
+      #and save
+      ggsave(
+        glue("{output_path}/{names}_{type}_{year}_vector-field.png"),
+        vector_field_map,
+        width = 14, height = 10, units = 'in')
+        
+    })
+  }
+}
+
+```
+
+This concludes the data mapping script.
+
+```{r}
+
+#just to access the "run above" button
+
+```

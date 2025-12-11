@@ -1,0 +1,978 @@
+---
+title: "Northern Three Spatial Analyses (eReefs Introduction and General Method Testing)"
+author: "Adam Shand"
+date: "`r format(Sys.time(), '%d, %B, %Y')`"
+format: html
+params:
+  project_crs: "EPSG:7844"
+  target_fyear: 2024
+---
+
+::: {.callout-note}
+This is one part of several scripts exploring CSIRO ereefs data. 
+:::
+
+# Introduction
+
+eReefs is a ocean data modelling program created in partnership between CSIRO, AIMS, and government. The modeled data outputs are hosted online and are free to download, however a major issue with this data is its format. Data is provided in the NetCDF format (which requires specialist software to read), and aligned to a curvilinear grid (which requires extensive understand of the behind-the-scenes processes involved in gridding data. A full timeline of the exploration of the eReefs platform is detailed in [issue 56](https://github.com/Northern-3/spatial-analyses/issues/56). This script introduces several data handling methods for the eReefs modeled outputs, in particular, options to handle the curvilinear grid feature. The workflow options explored are:
+
+ - Using an R package developed by aims: `ereefs`
+ - Using the well known raster package `terra`
+ - Sourcing data from alternate providers that use a linear grid rather than a curvilinear grid
+ - Using the newer R package `stars`[^1]
+
+[^1]: This was identified as the optimal method
+
+The main objectives of this script is to determine the optimal method of data handling. Upon completing this script it has been identified that **the stars method is the optimal method of ereefs data handling**. Since then, the stars method has been provided its own script entirely to provided great exploration of the method. the stars method will no longer be covered in this script.
+
+:::{.callout-warning}
+There may be some issues running the eReefs functions with older versions of R - the desktop works with 4.3.0, but the laptop does not work with 4.2.1. See [issue 62](https://github.com/Northern-3/spatial-analyses/issues/62) for more.
+:::
+
+# Script Set Up
+
+This script requires multiple core spatial packages, each of which is loaded below. Key variables and paths are also created.
+
+```{r}
+#| label: load packages
+
+#use pacman function to load and install (if required) all other packages
+pacman::p_load(tidyverse, glue, here, janitor, sf, tmap, raster, terra, ereefs, ggplot2, RNetCDF)
+
+#load in the custom function used to create the read and write folders for the script
+source(here("functions/script_setup.R"))
+
+#run the function to create the folders and paths
+script_setup()
+
+#set project crs
+proj_crs <- params$project_crs
+
+#turn off s2 geometry
+sf_use_s2(FALSE)
+
+```
+
+# Method 1: AIMS' ereefs package
+
+AIMS provides a package specifically designed to handling eReefs data, it is efficient and effective however is built on R packages that are set to retire in October 2023 such as the raster package and rgdal. For this reason using the AIMS ereefs package method exclusively as a standalone method will not be considered as a viable workflow, and will not be demonstrated in this script. Instead, components of the package that will not be retired are demonstrated as part of the terra workflow below.
+
+# Method 2: terra package
+
+The terra package is an R package that is scheduled to replace the outdated raster package. Terra is a package I am very familiar with and it has notable advantages over raster in terms of speed and usability. However, to manipulate the eReefs data into a form usable by terra we will have to cannibalize some of the functions in AIMS' ereefs package (the bits that are not set to expire). The functions we are interested in are:
+
+ - map_ereefs()
+ - poly2sp()
+ - sp2raster()
+
+#### map_ereefs()
+
+The very first function that is introduced by the package is `map_ereefs()`. This function is huge and contains several important steps. To peak behind the curtain and see the code within the function, open the code chunk below.
+
+```{r}
+#| label: peak behind the map_ereefs function
+#| eval: false
+
+map_ereefs
+function (var_name = "true_colour", target_date = c(2018, 1, 
+    30), layer = "surface", Land_map = FALSE, input_file = "catalog", 
+    input_grid = NA, scale_col = c("ivory", "coral4"), scale_lim = c(NA, 
+        NA), zoom = 6, box_bounds = c(NA, NA, NA, NA), p = NA, 
+    suppress_print = TRUE, return_poly = FALSE, label_towns = TRUE, 
+    strict_bounds = FALSE, mark_points = NULL, gbr_poly = FALSE) 
+{
+    input_file <- substitute_filename(input_file)
+    ereefs_case <- get_ereefs_case(input_file)
+    input_stem <- get_file_stem(input_file)
+    local_file <- TRUE
+    if (length(p) != 1) 
+        Land_map <- FALSE
+    if (suppress_print) 
+        Land_map <- FALSE
+    towns <- data.frame(latitude = c(-15.47027987, -16.0899, 
+        -16.484, -16.92303816, -19.26639219, -20.0136699, -20.07670986, 
+        -20.40109791, -21.15345122, -22.82406858, -23.38031858, 
+        -23.84761069, -24.8662122, -25.54073075, -26.18916037), 
+        longitude = c(145.2498605, 145.4622, 145.4623, 145.771, 
+            146.805701, 148.2475387, 146.2635394, 148.5802016, 
+            149.1655418, 147.6363616, 150.5059485, 151.256349, 
+            152.3478987, 152.7049316, 152.6581893), town = c("Cooktown", 
+            "Cape Tribulation", "Port Douglas", "Cairns", "Townsville", 
+            "Bowen", "Charters Towers", "Prosperine", "Mackay", 
+            "Clermont", "Rockhampton", "Gladstone", "Bundaberg", 
+            "Maryborough", "Gympie"))
+    grids <- get_ereefs_grids(input_file, input_grid)
+    x_grid <- grids[["x_grid"]]
+    y_grid <- grids[["y_grid"]]
+    if (layer <= 0) {
+        z_grid <- grids[["z_grid"]]
+        layer <- max(which(z_grid < layer))
+    }
+    if (is.vector(target_date)) {
+        target_date <- as.Date(paste(target_date[1], target_date[2], 
+            target_date[3], sep = "-"))
+    }
+    else if (is.character(target_date)) {
+        target_date <- as.Date(target_date)
+    }
+    if ((!is.na(ereefs_case[1])) && (ereefs_case[2] != "unknown")) {
+        if (ereefs_case[2] == "4km") {
+            input_file <- paste0(input_stem, format(target_date, 
+                "%Y-%m"), ".nc")
+            nc <- safe_nc_open(input_file)
+            if (!is.null(nc$var[["t"]])) {
+                ds <- as.Date(safe_ncvar_get(nc, "t"), origin = as.Date("1990-01-01"))
+            }
+            else {
+                ds <- as.Date(safe_ncvar_get(nc, "time"), origin = as.Date("1990-01-01"))
+            }
+            day <- which.min(abs(target_date - ds))
+            ncdf4::nc_close(nc)
+        }
+        else if (ereefs_case[2] == "1km") {
+            day <- 1
+            ds <- target_date
+            input_file <- paste0(input_stem, format(target_date, 
+                "%Y-%m-%d"), ".nc")
+        }
+    }
+    else {
+        nc <- safe_nc_open(input_file)
+        if (!is.null(nc$var[["t"]])) {
+            ds <- as.Date(safe_ncvar_get(nc, "t"), origin = as.Date("1990-01-01"))
+        }
+        else {
+            ds <- as.Date(safe_ncvar_get(nc, "time"), origin = as.Date("1990-01-01"))
+        }
+        dum1 <- abs(target_date - ds)
+        if (min(dum1) > 1) 
+            warning(paste("Target date", target_date, "is", min(dum1), 
+                "days from closest available date in", input_file, 
+                ds[min(dum1)]))
+        day <- which.min(abs(target_date - ds))
+        ncdf4::nc_close(nc)
+    }
+    if (var_name == "true_color") {
+        var_name <- "true_colour"
+    }
+    dims <- dim(x_grid) - 1
+    outOfBox <- array(FALSE, dim = dim(x_grid))
+    if (!is.na(box_bounds[1])) {
+        outOfBox <- apply(x_grid, 2, function(x) {
+            (x < box_bounds[1] | is.na(x))
+        })
+    }
+    if (!is.na(box_bounds[2])) {
+        outOfBox <- outOfBox | apply(x_grid, 2, function(x) {
+            (x > box_bounds[2] | is.na(x))
+        })
+    }
+    if (!is.na(box_bounds[3])) {
+        outOfBox <- outOfBox | apply(y_grid, 2, function(x) {
+            (x < box_bounds[3] | is.na(x))
+        })
+    }
+    if (!is.na(box_bounds[4])) {
+        outOfBox <- outOfBox | apply(y_grid, 2, function(x) {
+            (x > box_bounds[4] | is.na(x))
+        })
+    }
+    if (is.na(box_bounds[1])) {
+        xmin <- 1
+    }
+    else {
+        xmin <- which(apply(!outOfBox, 1, any))[1]
+        if (length(xmin) == 0) 
+            xmin <- 1
+    }
+    if (is.na(box_bounds[2])) {
+        xmax <- dims[1]
+    }
+    else {
+        xmax <- which(apply(!outOfBox, 1, any))
+        xmax <- xmax[length(xmax)]
+        if ((length(xmax) == 0) | (xmax > dims[1])) 
+            xmax <- dims[1]
+    }
+    if (is.na(box_bounds[3])) {
+        ymin <- 1
+    }
+    else {
+        ymin <- which(apply(!outOfBox, 2, any))[1]
+        if (length(ymin) == 0) 
+            ymin <- 1
+    }
+    if (is.na(box_bounds[4])) {
+        ymax <- dims[2]
+    }
+    else {
+        ymax <- which(apply(!outOfBox, 2, any))
+        ymax <- ymax[length(ymax)]
+        if ((length(ymax) == 0) | (ymax > dims[2])) 
+            ymax <- dims[2]
+    }
+    x_grid <- x_grid[xmin:(xmax + 1), ymin:(ymax + 1)]
+    y_grid <- y_grid[xmin:(xmax + 1), ymin:(ymax + 1)]
+    if (var_name == "plume") {
+        if (!local_file) {
+            input_file <- paste0(input_file, "?R_412,R_443,R_488,R_531,R_547,R_667,R_678")
+        }
+        else input_file <- input_file
+        nc <- safe_nc_open(input_file)
+        R_412 <- safe_ncvar_get(nc, "R_412", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1))
+        R_443 <- safe_ncvar_get(nc, "R_443", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1))
+        R_488 <- safe_ncvar_get(nc, "R_488", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1))
+        R_531 <- safe_ncvar_get(nc, "R_531", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1))
+        R_547 <- safe_ncvar_get(nc, "R_547", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1))
+        R_667 <- safe_ncvar_get(nc, "R_667", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1))
+        R_678 <- safe_ncvar_get(nc, "R_678", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1))
+        rsr <- list(R_412, R_443, R_488, R_531, R_547, R_667, 
+            R_678)
+        ems_var <- plume_class(rsr)
+        dims <- dim(ems_var)
+        var_units <- ""
+        var_longname <- "Plume colour class"
+    }
+    else if (var_name == "true_colour") {
+        if (!local_file) {
+            input_file <- paste0(input_file, "?R_470,R_555,R_645")
+        }
+        else input_file <- input_file
+        nc <- safe_nc_open(input_file)
+        TCbright <- 10
+        R_470 <- safe_ncvar_get(nc, "R_470", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1)) * 
+            TCbright
+        R_555 <- safe_ncvar_get(nc, "R_555", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1)) * 
+            TCbright
+        R_645 <- safe_ncvar_get(nc, "R_645", start = c(xmin, 
+            ymin, day), count = c(xmax - xmin, ymax - ymin, 1)) * 
+            TCbright
+        R_470[R_470 > 1] <- 1
+        R_555[R_555 > 1] <- 1
+        R_645[R_645 > 1] <- 1
+        unscaledR = c(0, 30, 60, 120, 190, 255)/255
+        scaledR = c(1, 110, 160, 210, 240, 255)/255
+        scalefun <- approxfun(x = unscaledR, y = scaledR, yleft = 1, 
+            yright = 255)
+        red <- scalefun(R_645)
+        green <- scalefun(R_555)
+        blue <- scalefun(R_470)
+        red[is.na(red)] <- 0
+        green[is.na(green)] <- 0
+        blue[is.na(blue)] <- 0
+        ems_var <- rgb(red, green, blue)
+        ems_var[ems_var == "#000000"] <- NA
+        ems_var <- array(as.character(ems_var), dim = dim(R_645))
+        dims <- dim(ems_var)
+        var_longname <- "Simulated true colour"
+        var_units <- ""
+    }
+    else if (var_name == "ZooT") {
+        if (!local_file) {
+            input_file <- paste0(input_file, "?ZooL_N,ZooS_N")
+        }
+        else input_file <- input_file
+        nc <- safe_nc_open(input_file)
+        dims <- nc$var[["ZooL_N"]][["size"]]
+        if (is.null(dims)) 
+            stop(paste("ZooL_N", " not found in netcdf file."))
+        ndims <- length(dims)
+        if ((ndims > 3) && (layer == "surface")) 
+            layer <- dims[3]
+        var_longname <- "Total zooplankton nitrogen"
+        var_units <- "mg N m-3"
+    }
+    else if (var_name == "speed") {
+        if (!local_file) {
+            input_file <- paste0(input_file, "?u,v")
+        }
+        else input_file <- input_file
+        nc <- safe_nc_open(input_file)
+        dims <- nc$var[["u"]][["size"]]
+        if (is.null(dims)) 
+            stop(paste("u", " not found in netcdf file."))
+        ndims <- length(dims)
+        if ((ndims > 3) && (layer == "surface")) 
+            layer <- dims[3]
+        var_longname <- "Current speed"
+        var_units <- "m s-1"
+    }
+    else {
+        if (!local_file) {
+            input_file <- paste0(input_file, "?", var_name)
+        }
+        else input_file <- input_file
+        nc <- safe_nc_open(input_file)
+        dims <- nc$var[[var_name]][["size"]]
+        if (is.null(dims)) 
+            stop(paste(var_name, " not found in netcdf file."))
+        ndims <- length(dims)
+        if ((ndims > 3) && (layer == "surface")) 
+            layer <- dims[3]
+    }
+    if (var_name == "ZooT") {
+        var_longname <- "Total Zooplankton Nitrogen"
+        var_units <- "mg N m3"
+        if (ndims == 4) {
+            ems_var <- safe_ncvar_get(nc, "ZooL_N", start = c(xmin, 
+                ymin, layer, day), count = c(xmax - xmin, ymax - 
+                ymin, 1, 1))
+            ems_var <- ems_var + safe_ncvar_get(nc, "ZooS_N", 
+                start = c(xmin, ymin, layer, day), count = c(xmax - 
+                  xmin, ymax - ymin, 1, 1))
+        }
+        else {
+            ems_var <- safe_ncvar_get(nc, "ZooL_N", start = c(xmin, 
+                ymin, day), count = c(xmax - xmin, ymax - ymin, 
+                1))
+            ems_var <- ems_var + safe_ncvar_get(nc, "ZooS_N", 
+                start = c(xmin, ymin, day), count = c(xmax - 
+                  xmin, ymax - ymin, 1))
+        }
+    }
+    else if (var_name == "speed") {
+        var_longname <- "Current speed"
+        var_units <- "m s-1"
+        if (ndims == 4) {
+            ems_var <- safe_ncvar_get(nc, "u1", start = c(xmin, 
+                ymin, layer, day), count = c(xmax - xmin, ymax - 
+                ymin, 1, 1))
+            ems_var <- sqrt(ems_var^2 + safe_ncvar_get(nc, "u2", 
+                start = c(xmin, ymin, layer, day), count = c(xmax - 
+                  xmin, ymax - ymin, 1, 1))^2)
+        }
+        else {
+            ems_var <- safe_ncvar_get(nc, "u1", start = c(xmin, 
+                ymin, day), count = c(xmax - xmin, ymax - ymin, 
+                1))
+            ems_var <- ems_var + safe_ncvar_get(nc, "u2", start = c(xmin, 
+                ymin, day), count = c(xmax - xmin, ymax - ymin, 
+                1))
+        }
+    }
+    else if (!((var_name == "true_colour") || (var_name == "plume"))) {
+        vat <- ncdf4::ncatt_get(nc, var_name)
+        var_longname <- vat$long_name
+        var_units <- vat$units
+        if (ndims == 4) {
+            ems_var <- safe_ncvar_get(nc, var_name, start = c(xmin, 
+                ymin, layer, day), count = c(xmax - xmin, ymax - 
+                ymin, 1, 1))
+        }
+        else {
+            ems_var <- safe_ncvar_get(nc, var_name, start = c(xmin, 
+                ymin, day), count = c(xmax - xmin, ymax - ymin, 
+                1))
+        }
+    }
+    ncdf4::nc_close(nc)
+    nc <- safe_nc_open(input_file)
+    if (!is.null(nc$var[["botz"]])) {
+        botz <- safe_ncvar_get(nc, "botz", start = c(xmin, ymin), 
+            count = c(xmax - xmin, ymax - ymin))
+    }
+    else {
+        botz <- array(NA, dim(ems_var))
+    }
+    if (is.null(nc$var[["latitude"]])) {
+        latitude <- safe_ncvar_get(nc, "y_centre", start = c(xmin, 
+            ymin), count = c(xmax - xmin, ymax - ymin))
+        longitude <- safe_ncvar_get(nc, "x_centre", start = c(xmin, 
+            ymin), count = c(xmax - xmin, ymax - ymin))
+    }
+    else {
+        latitude <- safe_ncvar_get(nc, "latitude", start = c(xmin, 
+            ymin), count = c(xmax - xmin, ymax - ymin))
+        longitude <- safe_ncvar_get(nc, "longitude", start = c(xmin, 
+            ymin), count = c(xmax - xmin, ymax - ymin))
+    }
+    ncdf4::nc_close(nc)
+    a <- dim(ems_var)[1]
+    b <- dim(ems_var)[2]
+    gx <- c(x_grid[1:a, 1:b], x_grid[2:(a + 1), 1:b], x_grid[2:(a + 
+        1), 2:(b + 1)], x_grid[1:a, 2:(b + 1)])
+    gy <- c(y_grid[1:a, 1:b], y_grid[2:(a + 1), 1:b], y_grid[2:(a + 
+        1), 2:(b + 1)], y_grid[1:a, 2:(b + 1)])
+    gx <- array(gx, dim = c(a * b, 4))
+    gy <- array(gy, dim = c(a * b, 4))
+    gx_ok <- !apply(is.na(gx), 1, any)
+    gy_ok <- !apply(is.na(gy), 1, any)
+    n <- c(ems_var)[gx_ok & gy_ok]
+    gx <- c(t(gx[gx_ok & gy_ok, ]))
+    gy <- c(t(gy[gx_ok & gy_ok, ]))
+    longitude <- c(longitude)[gx_ok & gy_ok]
+    latitude <- c(latitude)[gx_ok & gy_ok]
+    botz <- c(botz)[gx_ok & gy_ok]
+    id <- 1:length(n)
+    id <- as.factor(id)
+    values <- data.frame(id = id, value = n, depth = botz, x_centre = longitude, 
+        y_centre = latitude)
+    positions <- data.frame(id = rep(id, each = 4), x = gx, y = gy)
+    datapoly <- merge(values, positions, by = c("id"))
+    if ((var_name != "true_colour") && (is.na(scale_lim[1]))) {
+        scale_lim <- c(min(n, na.rm = TRUE), max(n, na.rm = TRUE))
+    }
+    if (Land_map) {
+        MapLocation <- c(min(gx, na.rm = TRUE) - 0.5, min(gy, 
+            na.rm = TRUE) - 0.5, max(gx, na.rm = TRUE) + 0.5, 
+            max(gy, na.rm = TRUE) + 0.5)
+        p <- ggplot2::ggplot() + ggplot2::geom_polygon(data = map.df, 
+            colour = "black", fill = "lightgrey", size = 0.5, 
+            ggplot2::aes(x = long, y = lat, group = group))
+    }
+    else if (length(p) == 1) {
+        p <- ggplot2::ggplot()
+    }
+    p <- p + ggplot2::geom_polygon(ggplot2::aes(x = x, y = y, 
+        fill = value, group = id), data = datapoly)
+    if (var_name == "true_colour") {
+        p <- p + ggplot2::scale_fill_identity()
+    }
+    else if (scale_col[1] == "spectral") {
+        p <- p + ggplot2::scale_fill_distiller(palette = "Spectral", 
+            na.value = "transparent", guide = "colourbar", limits = scale_lim, 
+            name = var_units, oob = scales::squish)
+    }
+    else if (length(scale_col) < 3) {
+        if (length(scale_col) == 1) 
+            scale_col <- c("ivory", scale_col)
+        p <- p + ggplot2::scale_fill_gradient(low = scale_col[1], 
+            high = scale_col[2], na.value = "transparent", guide = "colourbar", 
+            limits = scale_lim, name = var_units, oob = scales::squish)
+    }
+    else {
+        p <- p + ggplot2::scale_fill_gradient2(low = scale_col[1], 
+            mid = scale_col[2], high = scale_col[3], na.value = "transparent", 
+            guide = "colourbar", limits = scale_lim, midpoint = (scale_lim[2] - 
+                scale_lim[1])/2, space = "Lab", name = var_units, 
+            oob = scales::squish)
+    }
+    if (label_towns) {
+        towns <- towns[towns$latitude >= min(gy, na.rm = TRUE), 
+            ]
+        towns <- towns[towns$latitude <= max(gy, na.rm = TRUE), 
+            ]
+        towns <- towns[towns$longitude >= min(gx, na.rm = TRUE), 
+            ]
+        towns <- towns[towns$longitude <= max(gx, na.rm = TRUE), 
+            ]
+        if (dim(towns)[1] > 0) 
+            p <- p + ggplot2::geom_text(data = towns, ggplot2::aes(x = longitude, 
+                y = latitude, label = town, hjust = "right"), 
+                nudge_x = -0.1) + ggplot2::geom_point(data = towns, 
+                ggplot2::aes(x = longitude, y = latitude))
+    }
+    p <- p + ggplot2::ggtitle(paste(var_longname, format(chron::chron(as.numeric(ds[day]) + 
+        1e-06), "%Y-%m-%d %H:%M"))) + ggplot2::xlab("longitude") + 
+        ggplot2::ylab("latitude")
+    if (!is.null(mark_points)) {
+        if (is.null(dim(mark_points))) 
+            mark_points <- data.frame(latitude = mark_points[1], 
+                longitude = mark_points[2])
+        p <- p + ggplot2::geom_point(data = mark_points, ggplot2::aes(x = longitude, 
+            y = latitude), shape = 4)
+    }
+    if (gbr_poly) {
+        p <- p + ggplot2::geom_path(data = sdf.gbr, ggplot2::aes(y = lat, 
+            x = long, group = group))
+    }
+    if (all(is.na(box_bounds))) {
+        p <- p + ggplot2::coord_map(xlim = c(min(gx, na.rm = TRUE), 
+            max(gx, na.rm = TRUE)), ylim = c(min(gy, na.rm = TRUE), 
+            max(gy, na.rm = TRUE)))
+    }
+    else {
+        p <- p + ggplot2::coord_map(xlim = box_bounds[1:2], ylim = box_bounds[3:4]) + 
+            ggplot2::theme(panel.border = ggplot2::element_rect(linetype = "solid", 
+                colour = "grey", fill = NA))
+    }
+    if (!suppress_print) 
+        print(p)
+    if (return_poly) {
+        return(list(p = p, datapoly = datapoly, longitude = longitude, 
+            latitude = latitude))
+    }
+    else {
+        return(p)
+    }
+}
+
+```
+
+One of the important reasons that we need to look into this function is so that we can stop the function part way and extract values that are otherwise "lost" (not returned to the global environment. A secondary reason is that parts of this function are not needed at all, and we can save some time and improve readability by skipping them.
+
+In the code chunks below I have stripped back the function and converted it into singular lines of code to track what is happening. Note that this chunk has become very specific to what we need and should absolutely not be viewed as an "improvement" on the function - because it is not.
+
+The variable `datapoly` is the key output we are looking for from this chunk. It is a dataframe with columns for id, value, the depth at each coordinate (not the depth of the sample), the true x and y values, and the linearly adjusted x and y centers.
+
+The first part of the function is to set variables and establish connection to the file (via http link). Currently we are looking at the chl_a_sum variable, but in the next code chunk below we list out all the options of variables we can look at.
+
+```{r}
+#| label: set variables and connect to file
+
+#assign each of the variables that are listed in the function (only the ones we need)
+var_name <- "Chl_a_sum" #changing to whatever we want
+target_date <- as.Date("2023-02-28") #format is more flexible when used within the function
+#input_file <- "catalog" #use catalog to initial a user choice selection of model
+input_file <- "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml"
+input_grid <- NA #must be NA
+layer <- "surface" #set the desired layer
+box_bounds <- c(145, 150, -22, -18) #defines the area to look at, can be NA*4, or follow xmin, xmax, ymin, ymax
+  
+#establish the initial file path
+input_file <- substitute_filename(input_file)
+  
+#connect to the file using the ereefs supplied "safe" opening
+nc <- safe_nc_open(input_file)
+
+```
+
+Once connected to the file we can do a quick inspection and look at the dimensions and available variables.
+
+```{r}
+#| label: inspect file
+
+#look at the available dimensions. Pay close attention to the first three as these are used for the next step.
+names(nc$dim)
+
+#look at all available variables (this can be used to guide the var_name variable defined at the top of the chunk)
+head(names(nc$var), n = 15)
+
+```
+
+Then we grab some specific variables including the xy grid, time, and dimensions.
+
+```{r}
+#| label: get specific variables
+
+#get the x and y grid for the data (Note. that ereefs has a special function that does this).
+grids <- get_ereefs_grids(input_file, input_grid)
+
+#get the x grid and y grid specifically. These are 2D matrices of values
+x_grid <- grids[["x_grid"]]
+y_grid <- grids[["y_grid"]]
+
+#get time, variable name is guided by dim code run above
+ds <- as.Date(safe_ncvar_get(nc, "time"), origin = as.Date("1990-01-01"))
+
+#get a list of time difference (in days) between our target date and all of the time layers in the file
+dum1 <- abs(target_date - ds)
+    
+#get the index of the time layer that is closest to our taget date
+day <- which.min(abs(target_date - ds))
+
+#get the dimensions minus 1
+dims <- dim(x_grid) - 1
+
+```
+
+Because we are going to crop the data we need to do some funky stuff with a bunch of matrices now. In short, we create a matrix of values that all say "FALSE" (This matrix has the same dimensions as the matrix of data we are connected to). Then we conditionally change the value to say "TRUE" if the position of value is outside of the area that we want to crop to. Visually it looks a bit like this:
+
+FALSE FALSE FALSE     
+FALSE FALSE FALSE     
+FALSE FALSE FALSE    
+
+goes to (for example):
+
+TRUE  TRUE  TRUE          
+TRUE  FALSE FALSE       
+TRUE  FALSE FALSE    
+
+We can these use this T/F matrix to "crop" the data to the lower right corner.
+
+```{r}
+#| label: create an outofBox matrix
+
+#create a matrix of "FALSE" the same dimensions as the x_grid matrix
+outOfBox <- array(FALSE, dim = dim(x_grid))
+
+#look at the values in the x and y grids, and compare them to the appropriate values of the box_bounds (1,2,3,4). If the x and y grid values are "outside"
+#the box bounds then change the "FALSE" value to a "TRUE" value in the outOfBox matrix
+if (!is.na(box_bounds[1])) {outOfBox <- apply(x_grid, 2, function(x) {(x < box_bounds[1] | is.na(x))})}
+if (!is.na(box_bounds[2])) {outOfBox <- outOfBox | apply(x_grid, 2, function(x) {(x > box_bounds[2] | is.na(x))})}
+if (!is.na(box_bounds[3])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x < box_bounds[3] | is.na(x))})}
+if (!is.na(box_bounds[4])) {outOfBox <- outOfBox | apply(y_grid, 2, function(x) {(x > box_bounds[4] | is.na(x))})}
+
+#for each of the four values in the box_bounds object, set the xmin, xmax, ymin, and ymax values
+if (is.na(box_bounds[1])) {
+  xmin <- 1
+} else {
+  xmin <- which(apply(!outOfBox, 1, any))[1]
+  if (length(xmin) == 0) {xmin <- 1}
+}
+
+if (is.na(box_bounds[2])) {
+  xmax <- dims[1]
+} else {
+  xmax <- which(apply(!outOfBox, 1, any))
+  xmax <- xmax[length(xmax)]
+  if ((length(xmax) == 0) | (xmax > dims[1])) {xmax <- dims[1]}
+}
+
+if (is.na(box_bounds[3])) {
+  ymin <- 1
+} else {
+  ymin <- which(apply(!outOfBox, 2, any))[1]
+  if (length(ymin) == 0) {ymin <- 1}
+}
+
+if (is.na(box_bounds[4])) {
+  ymax <- dims[2]
+} else {
+  ymax <- which(apply(!outOfBox, 2, any))
+  ymax <- ymax[length(ymax)]
+  if ((length(ymax) == 0) | (ymax > dims[2])) {ymax <- dims[2]}
+}
+
+#cut the x and y grids down to only be within our boundaries
+x_grid <- x_grid[xmin:(xmax + 1), ymin:(ymax + 1)]
+y_grid <- y_grid[xmin:(xmax + 1), ymin:(ymax + 1)]
+
+```
+
+Finally we can actually look at getting the data that we are interested in, rather than just its dimensions. Below we pull out multiple parts of the variable including its:
+
+ - dimensions (lat, long, depth, other.).
+ - values.
+ - units.
+ - long name.
+ - depth (of the ocean at the sample point, not the depth of the sample itself).
+ - latitude.
+ - longitude.
+
+```{r}
+#| label: get the variable we are interested in
+
+#get the dimensions specifically of the variable we are looking at, we are looking to figure out the layer
+dims <- nc$var[[var_name]][["size"]]
+ndims <- length(dims) #we are expecting there to be a length of 3 or more (lat, long, depth, other.)
+
+#update the layer value. Note that layer is depth, and is ordered in rev (i.e. 1 = deepest, and biggest value = surface)
+if ((ndims > 3) && (layer == "surface")) {layer <- dims[3]}
+
+#get information about the variable to be obtained  
+vat <- ncdf4::ncatt_get(nc, var_name)
+var_longname <- vat$long_name
+var_units <- vat$units
+
+#get the variable (finally) as a matrix only in the location that we established in the code chunk above
+#Right now we are only taking the surface layer and only taking one time step
+ems_var <- safe_ncvar_get(nc, var_name, 
+                          start = c(xmin, ymin, layer, day), #note that start indicates the index to start the data request from
+                          count = c(xmax - xmin, ymax - ymin, 1, 1)) #and count indicates how many steps to take for each number)
+
+#get other required variables: botz, latitude, and longitude (remember to look at var names if these aren't running)
+botz <- safe_ncvar_get(nc, "botz", start = c(xmin, ymin), 
+                       count = c(xmax - xmin, ymax - ymin))
+latitude <- safe_ncvar_get(nc, "latitude", start = c(xmin, ymin), 
+                           count = c(xmax - xmin, ymax - ymin))
+longitude <- safe_ncvar_get(nc, "longitude", start = c(xmin, ymin), 
+                            count = c(xmax - xmin, ymax - ymin))
+
+#we now have everything we need so we can close to the connection to the file
+ncdf4::nc_close(nc)
+
+```
+
+Once all of those individual aspects of the variable have been collected they need to be combined, and everything needs to be translated from a curvilinear dataset to a linear gridded dataset.
+
+```{r}
+#| label: combine each aspect and transform data
+
+#get the dimensions of matrix that our variable is in (which should be same as xmax - xmin, ymax - ymin)
+a <- dim(ems_var)[1]
+b <- dim(ems_var)[2]
+
+#create two numeric vectors of all the x (long) and y (lat) values for the variable
+gx <- c(x_grid[1:a, 1:b], x_grid[2:(a + 1), 1:b], x_grid[2:(a + 1), 2:(b + 1)], x_grid[1:a, 2:(b + 1)])
+gy <- c(y_grid[1:a, 1:b], y_grid[2:(a + 1), 1:b], y_grid[2:(a + 1), 2:(b + 1)], y_grid[1:a, 2:(b + 1)])
+
+#convert each into a matrix
+gx <- array(gx, dim = c(a * b, 4))
+gy <- array(gy, dim = c(a * b, 4))
+
+#create a matrix checking if all values are present
+gx_ok <- !apply(is.na(gx), 1, any)
+gy_ok <- !apply(is.na(gy), 1, any)
+  
+#get all values where TRUE as a vector
+n <- c(ems_var)[gx_ok & gy_ok]
+
+#convert from a matrix back to a numeric vector
+gx <- c(t(gx[gx_ok & gy_ok, ]))
+gy <- c(t(gy[gx_ok & gy_ok, ]))
+
+#get all values where TRUE as a vector
+longitude <- c(longitude)[gx_ok & gy_ok]
+latitude <- c(latitude)[gx_ok & gy_ok]
+botz <- c(botz)[gx_ok & gy_ok]
+
+#get an id for all rows
+id <- 1:length(n)
+id <- as.factor(id)
+  
+#create a data frame using all the vectors created above
+values <- data.frame(id = id, value = n, depth = botz, x_centre = longitude, y_centre = latitude)
+
+#create a second data frame with the linearly gridded x and y values
+positions <- data.frame(id = rep(id, each = 4), x = gx, y = gy)
+  
+#merge the two dataframe by id
+datapoly <- merge(values, positions, by = c("id"))
+
+#clean up all the variables created
+rm(a, b, botz, box_bounds, day, dims, ds, dum1, ems_var, grids, gx, gx_ok, gy, gy_ok, id, input_file,
+   input_grid, latitude, layer, longitude, n, nc, ndims, outOfBox, positions, target_date, values, var_longname,
+   var_name, var_units, vat, x_grid, xmax, xmin, y_grid, ymax, ymin)
+
+```
+
+The variable of interest has now been downloaded and is stored in the "datapoly" variable, which looks like this (only pulling 20 of 800,000+ rows):
+
+```{r}
+#| label: show dataframe
+
+temp <- slice(datapoly, 21:40)
+
+temp
+
+```
+
+However this is only step 1 of 3 as it still needs to converted to a usable spatial layer.
+
+#### poly2sp
+
+Now we have a data frame with everything that we want we need to convert it. Again, the ereefs package has a function that can be used for this (`poly2sp`). Thankfully this time it can be used without alteration. It produces a spatial polygon dataframe.
+
+::: {.callout-note}
+The code below takes a bit to run, so it will pull a saved version instead if that exists
+:::
+
+```{r}
+#| label: use poly2sp
+#| output: false
+
+#skip over this step is it has already been completed
+if (file.exists(glue("{output_path}/chla_single.nc"))){
+  
+  #load data
+  r <- rast(glue("{output_path}/chla_single.nc"))
+  
+} else {#convert the datapoly to a spatialpolygonsdataset
+
+  sp_data <- poly2sp(datapoly)
+  
+}
+
+```
+
+#### sp2raster
+
+The final eReefs function we are interested in is `sp2raster`. Similar to above, this function does exactly what we need, but unfortunately utilizes R packages that are set to be retired/and that are not part of the standard workflow.
+
+A quote from using the old packages: _"Please note that rgdal will be retired during October 2023, plan transition to sf/stars/terra functions using GDAL and PROJ at your earliest convenience. See https://r-spatial.org/r/2023/05/15/evolution4.html and https://github.com/r-spatial/evolution"_
+
+Here is how the internals of the function look:
+
+```{r}
+#| label: explore sp2raster
+
+sp2raster
+
+```
+
+The key point to note in this function is the use of `raster::raster` and `raster::rasterize` which produce a RasterLayer. We will be replacing these with `terra::rast` and `terra::rasterize` which produced a SpatRaster and is significantly faster to run.
+
+```{r}
+#| label: breakdown sp2raster
+
+if (exists("r")){#do nothing
+  
+} else {#convert the spatialpolygonsdataset to a SpatRaster
+
+  spbbox <- summary(sp_data)$bbox #pull the bbox from the data
+  resolution = 0.01 #set resolution of data, smaller number = greater resolution
+  
+  #get each of the mins and maxes separately
+  xmx <- spbbox["x", "max"]
+  ymx <- spbbox["y", "max"]
+  xmn <- spbbox["x", "min"]
+  ymn <- spbbox["y", "min"]
+      
+  #calculate the number of rows and columns we need
+  ncols <- as.integer((xmx - xmn)/resolution)
+  nrows <- as.integer((ymx - ymn)/resolution)
+      
+  #adjust the max x and y slightly, accounting for resolution
+  xmx <- xmn + resolution * ncols
+  ymx <- ymn + resolution * nrows
+      
+  #new version
+  r <- rast(ncol = ncols, nrow = nrows, xmin = xmn, xmax = xmx, ymin = ymn, ymax = ymx)
+      
+  #new version, note that the data has to be converted to an sf object first
+  r <- terra::rasterize(st_as_sf(sp_data), r, field = "value")
+  
+  #clean up all the variables created
+  rm(sp_data, spbbox, xmx, ymx, xmn, ymn, ncols, nrows)
+  
+  writeCDF(r, glue("{output_path}/chla_single.nc"))
+  
+}
+
+```
+
+And that it. We can now save, load, view, and manipulate the data using the standard workflow presented throughout this repo. 
+
+## Visual Comparison of Data
+
+To confirm at face value the validity of the data we will plot the original curvilinear dataset, and the new linear dataset. Excuse the differences in plotting type - they are completed by two separate programs.
+
+```{r}
+#| label: plot old
+
+map_ereefs(var_name = "Chl_a_sum", target_date = c(2023, 2, 28), input_file = "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml",
+  scale_col = "spectral", Land_map = TRUE, box_bounds = c(145, 150, -22, -18))
+
+```
+
+```{r}
+#| label: and new
+
+tm_shape(r) + 
+  tm_raster(col.scale = tm_scale_continuous(values = "-brewer.spectral"),
+            col.legend = tm_legend(reverse = T))
+
+```
+
+# Method 3: AIMS' linear grid datasets
+
+The core issue with CSIRO's ereefs datasets is that they are plotted on a curvilinear grid that must then be converted to a linear grid. This conversion takes a lot of time and understanding. To circumvent this road block AIMS also provide a pre-transformed version of the data. This transformed version is much easier to handle and understand. However the key issue with this data is the time delay - currently AIMS' linear gridded datasets are only available up to 2019 - 4 years behind the datasets that are available in the curvilinear format. For this reason the AIMS linear grid method is not a viable method, however the workflow is still demonstrated below as a record of the trial.
+
+## Download Total Nitrogen (TN) Data
+
+In the below code chunk we download TN data for the N3 region.
+
+```{r}
+#| label: download ereef TN data
+
+#reduce the n3_region file down to only the components we need
+n3_marine_region <- n3_region |> 
+  filter(Environment == "Marine")
+
+#create a bounding box of our study area for downloading
+n3_bbox <- st_bbox(n3_marine_region)
+  
+#create the file prefix for the path to download
+file_prefix <- "https://thredds.ereefs.aims.gov.au/thredds/dodsC/s3://aims-ereefs-public-prod/derived/ncaggregate/ereefs/GBR4_H2p0_B3p1_Cq3b_Dhnd/monthly-monthly/EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_monthly-monthly-"
+  
+#pick a date
+date_vector <- "2018-01" 
+
+#open the connection to the file
+file_path <- glue("{file_prefix}{date_vector}.nc")
+server_file <- open.nc(file_path)
+    
+#read the lat and long of the file we have connected with
+lon <- var.get.nc(server_file, "longitude")
+lat <- var.get.nc(server_file, "latitude")
+    
+#determine the minimum and maximum indices for each of our lats and longs
+lon_start <- which.min(abs(lon - n3_bbox[1] + 0.1)) #find the index within "lon" that is closest (but more than) n3_bbox[1]
+lat_start <- which.min(abs(lat - n3_bbox[2] + 0.1))
+lon_count <- which.min(abs(lon - n3_bbox[3] - 0.1)) - lon_start #find the index for the last lon we want to get
+lat_count <- which.min(abs(lat - n3_bbox[4] - 0.1)) - lat_start
+    
+#create the start and count vectors for how much data we are going to select
+start_vector <- c(lon_start, lat_start, 17, 1) #order is: long, lat, depth, time.
+count_vector <- c(lon_count, lat_count, 1, 1) #we only want to vary long and lat and keep everything else consistent
+    
+#get the specific variable and save it as a matrix
+file_matrix <- var.get.nc(ncfile = server_file, variable = "TN",
+                          start = start_vector, count = count_vector)
+    
+#close the connection to the file
+close.nc(server_file)
+        
+#calculate the extent based on the lat and long (xmin, ymin, xmax, ymax)
+rast_extent <- ext(c(min(lon[lon_start]), min(lat[lat_start]),
+                   max(lon[lon_start+lon_count]), max(lat[lat_start+lat_count])), xy = T)
+        
+#convert the matrix into a SpatRaster   
+tn <- file_matrix |> terra::t() |> rast(extent = rast_extent, crs = proj_crs) |> flip("vertical")
+        
+#update the time and name components of the raster
+time(tn) <- date(glue("{date_vector}-01"))
+names(tn) <- glue("TN_{date_vector}")
+
+```
+
+Here's how that looks:
+
+```{r}
+#| label: plot data
+
+#view
+plot(tn)
+
+```
+
+## Analyse Data
+
+Here we begin the data analysis component, first by creating a "Key Table" (a table that contains all layer names, dates, and associated info (e.g. financial year)). We can then utilize this table to calculate some summary statistics. These statistics and/or the raw cell values can then be used to calculate a score and grade for each variable.
+
+### Average Monthly Value
+
+The first on the list is to calculate a monthly value for each variable for each offshore zone in each of the regions. The code chunk below achieves this by using exactextract().
+
+```{r}
+#| label: calculate monthly value
+
+#select only the offshore zone
+n3_offshore <- n3_marine_region |> 
+  filter(BasinOrZone == "Offshore")
+  
+#get mean from all layers (make sure layers are monthly)
+tn_mean_region <- tibble(exactextractr::exact_extract(tn, n3_offshore, fun = "mean", append_cols = T))
+  
+#fix column names
+names(tn_mean_region) <- sub('mean.', '', names(tn_mean_region))
+  
+#add units
+tn_mean_region <- tn_mean_region |> mutate(units = "mg N m-3")
+  
+#pivot data, round values
+tn_mean_region <- pivot_longer(tn_mean_region, cols = 7:ncol(tn_mean_region),
+                            names_to = "layer_name", values_to = "monthly_mean")
+  
+```
+
+Additional calculations could then be run such as annual means etc, after downloading extra layers.
+
+## Visualise Data
+
+We can also visualise.
+
+```{r}
+#| label: test tmap
+
+tm_shape(tn) + 
+  tm_raster(col.scale = tm_scale_continuous(),
+            col.legend = tm_legend(reverse = T)) + 
+  tm_layout(legend.outside = T)
+
+```
+
+# Method 4: stars package
+
+As mentioned above, the stars method is the optimal method of ereefs data handling. The stars method has been provided its own script entirely.
+

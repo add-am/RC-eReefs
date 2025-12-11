@@ -1,0 +1,594 @@
+---
+title: "Northern Three Spatial Analyses (eReefs Linear Comparison)"
+author: "Adam Shand"
+date: "`r format(Sys.time(), '%d, %B, %Y')`"
+format: html
+params:
+  project_crs: "EPSG:7844"
+execute: 
+  warning: false
+---
+
+::: {.callout-tip}
+## R Version
+For R session info at the time of rendering this script see @sec-sessioninfo.
+:::
+
+::: {.callout-note}
+This is one part of several scripts exploring CSIRO ereefs data. 
+:::
+
+# Introduction
+
+This script is a supplementary script written to summarize the comparisons of ereefs model data against real-world logger data. This script compares data from;
+
+ - In situ loggers:
+        - Pandora MMP Logger
+        - Pelorus MMP Logger
+        - IMOS ANMN Logger
+ - Transformed model data:
+        - obtained using terra and aims packages
+ - Curvilinear model data:
+        - obtained using the aims package only
+        - obtained using the stars package
+        
+And compares data at times scales of:
+
+ - daily from 2023-02-05 to 2023-02-28
+ - daily from 2020 to 2022
+ - hourly for a random day
+ - hourly for all days from 2020 to 2022
+ - midday only from 2020 to 2022
+
+# Script Set Up
+
+The chunk below installs/loads packages.
+
+```{r}
+#| label: install/load packages dependencies
+#| output: false
+
+library(terra)
+library(stars)
+library(glue)
+library(here)
+library(ggplot2)
+library(sf)
+library(tidyverse)
+library(ereefs)
+library(tmap)
+
+```
+
+Then set variables and save locations.
+
+```{r}
+#| label: create save path and establish project crs
+
+#set project crs
+proj_crs <- params$project_crs
+
+#create a file path to help with saving outputs (other than data)
+save_outputs <- here("outputs/n3_ereefs_p3_linear-comparison/")
+
+#create a second path that will be used to save the datasets that we download
+save_data <- here("data//n3_ereefs_p3_linear-comparison/")
+
+#bring the paths to life
+dir.create(save_outputs)
+dir.create(save_data)
+
+#turn off s2 geometry
+sf_use_s2(FALSE)
+
+```
+
+# Load Data
+
+We can then load data from the folder, or create the datasets if this is the first time.
+
+## Loggers
+
+First up is the MMP and IMOS loggers, we will get daily loggers for Pandora, Pelorus, and the IMOS ANMN stations, and hourly loggers only for Pelorus.
+
+```{r}
+#| label: load loggers
+#| output: false
+
+if (file.exists(glue("{save_data}/all_loggers.csv"))){#if data exists, read it in
+  
+  loggers <- read.csv(glue("{save_data}/all_loggers.csv")) |> 
+    mutate(Date = ymd(Date))
+  
+} else {#otherwise make it
+
+  #read loggers
+  pandora_daily_logger <- read.csv(glue("{save_data}/pandora_daily_logger_clean.csv")) |> 
+    mutate(ID = "Pandora Logger", 
+           Freq = "Daily", 
+           Chla = CHL_QA_AVG, 
+           Date = dmy(SAMPLE_DAY),
+           Depth = "5m",
+           Type = "Point",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  #read loggers
+  pelorus_daily_logger <- read.csv(glue("{save_data}/pelorus_daily_logger_clean.csv")) |> 
+    mutate(ID = "Pelorus Logger", 
+           Freq = "Daily", 
+           Chla = CHL_QA_AVG, 
+           Date = dmy(SAMPLE_DAY),
+           Depth = "5m",
+           Type = "Point",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  #read loggers
+  imos_logger <- read.csv(glue("{save_data}/imos_anmn_logger_clean.csv")) |> 
+    mutate(ID = "IMOS Logger",
+           Freq = "Daily",
+           Type = "Point",
+           Hour = NA, 
+           Depth = DEPTH) |> 
+    mutate(CHLF = as.double(CHLF),
+           CHLU = as.double(CHLU),
+           CPHL = as.double(CPHL)) |> 
+    rowwise() |> 
+    mutate(Chla = mean(c(CHLF, CHLU, CPHL), na.rm = T)) |> 
+    separate_wider_delim(TIME, "T", names = c("Date", NA)) |> 
+    select(ID, Date, Hour, Freq, Type, CHLF, CHLU, CPHL, Chla)
+    group_by(ID, Date, Hour, Freq, Type) |> 
+    summarise(Chla = mean(Chla, na.rm = T)) |> 
+    ungroup()
+
+  #load in hourly data and do some trickery to get the 00:00:00 hour to play nicely
+  pelorus_hourly_logger <- read.csv(glue("{save_data}/pelorus_hourly_logger_clean.csv")) |>
+    separate_wider_delim(SAMPLE_HOUR, delim = " ", names = c("Date", "Hour"), too_few = "align_start") |>
+    mutate(Hour = case_when(is.na(Hour) ~ "00:00:00", T ~ Hour),
+           ID = "Pelorus Logger", 
+           Freq = "Hourly", 
+           Chla = CHL_QA_AVG, 
+           Depth = "5m",
+           Type = "Point",
+           Date = ymd(Date)) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  #bind into one dataset
+  loggers <- rbind(pandora_daily_logger, pelorus_daily_logger, pelorus_hourly_logger)
+  
+  #save data
+  write.csv(loggers, glue("{save_data}/all_loggers.csv"), row.names = F)
+  
+  #clean up
+  rm(pandora_daily_logger, pelorus_daily_logger, pelorus_hourly_logger)
+  
+}
+
+```
+
+## Transformed Model Data
+
+Then we will load in data from the transformed model. We will get data from the same coordinates as the Pandora logger, the same coordinates as the Pelorus logger, and data from an area of 0.075 degrees in every direction around each logger. All of this data is sampled at 0m, half is point samples, and half is area samples. The data spans from 2023-02-05 to 2023-02-28.
+
+```{r}
+#| label: load transformed dataset
+
+if (file.exists(glue("{save_data}/transformed_data.csv"))){#if data already exists read it in
+  
+  transformed_model <- read.csv(glue("{save_data}/transformed_data.csv")) |> 
+    mutate(Date = ymd(Date))
+  
+} else {#otherwise make the data
+
+  #read in transformed data NOTE: this is exclusively for the dates 2023-02-05 to 2023-02-28 at the surface layer
+  transformed_chla <- rast(glue("{save_data}/chla_final.nc"))
+  
+  #set pandora and pelorus versions
+  pan_latlon = data.frame(longitude = 146.4346, latitude = -18.8168)
+  pel_latlon = data.frame(longitude = 146.4886, latitude = -18.5406)
+  
+  #extract from specific point
+  pan_transformed <- terra::extract(transformed_chla, pan_latlon)
+  
+  #edit to match other datasets
+  pan_transformed <- pan_transformed |> 
+    pivot_longer(cols = 2:length(pan_transformed), names_to = "variable", values_to = "Chla") |> 
+    mutate(ID = "Pandora Transformed Model", 
+           Date = seq(as.Date("2023-02-05"), as.Date("2023-02-28"), by = "days"),
+           Freq = "Daily",
+           Depth = "0m",
+           Type = "Point",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  #extract from specific point
+  pel_transformed <- terra::extract(transformed_chla, pel_latlon)
+  
+  #edit to match other datasets
+  pel_transformed <- pel_transformed |> 
+    pivot_longer(cols = 2:length(pel_transformed), names_to = "variable", values_to = "Chla") |> 
+    mutate(ID = "Pelorus Transformed Model", 
+           Date = seq(as.Date("2023-02-05"), as.Date("2023-02-28"), by = "days"),
+           Freq = "Daily",
+           Depth = "0m",
+           Type = "Point",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  #get area versions for each
+  area_from_point <- function(numeric_pair, area = 0.15){
+    
+    coord_out <- st_polygon(list(cbind(c(numeric_pair[1] - area/2, numeric_pair[1] - area/2, 
+                                         numeric_pair[1] + area/2, numeric_pair[1] + area/2, 
+                                         numeric_pair[1] - area/2), 
+                                      c(numeric_pair[2] + area/2, numeric_pair[2] - area/2, 
+                                        numeric_pair[2] - area/2, numeric_pair[2] + area/2, 
+                                        numeric_pair[2] + area/2)))) |> st_sfc(crs = proj_crs)
+    coord_out <- vect(coord_out)
+  }
+  
+  #run function
+  pan_area <- area_from_point(as.numeric(pan_latlon))
+  pel_area <- area_from_point(as.numeric(pel_latlon))
+  
+  #extract from area
+  pan_transformed_area <- terra::extract(transformed_chla, pan_area, fun = mean, na.rm = TRUE)
+  
+  #edit to match other datasets
+  pan_transformed_area <- pan_transformed_area |> 
+    pivot_longer(cols = 2:length(pan_transformed_area), names_to = "variable", values_to = "Chla") |> 
+    mutate(ID = "Pandora Transformed Model", 
+           Date = seq(as.Date("2023-02-05"), as.Date("2023-02-28"), by = "days"),
+           Freq = "Daily",
+           Depth = "0m",
+           Type = "Area",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  #extract from area
+  pel_transformed_area <- terra::extract(transformed_chla, pel_area, fun = mean, na.rm = TRUE)
+  
+  #edit to match other datasets
+  pel_transformed_area <- pel_transformed_area |> 
+    pivot_longer(cols = 2:length(pel_transformed_area), names_to = "variable", values_to = "Chla") |> 
+    mutate(ID = "Pelorus Transformed Model", 
+           Date = seq(as.Date("2023-02-05"), as.Date("2023-02-28"), by = "days"),
+           Freq = "Daily",
+           Depth = "0m",
+           Type = "Area",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  #bind everything together
+  transformed_model <- rbind(pan_transformed, pan_transformed_area, pel_transformed, pel_transformed_area)
+  
+  #save data
+  write.csv(transformed_model, glue("{save_data}/transformed_data.csv"), row.names = F)
+  
+  #clean up
+  rm(transformed_chla, pan_transformed, pan_transformed_area, pel_transformed, pel_transformed_area,
+     pan_area, pan_latlon, pel_area, pel_latlon)
+  
+}
+
+```
+
+## Curvilinear Model Data
+
+Next we will get curvilinear data, we will get a point sample at the Pandora site at 0m, and at 5m, and a point sample at the Pelorus site at 0m and 5m. All of this data is point samples. The data spans from October 2020 to 2023-02-28.
+
+Please note that the function will regularly throw errors as the connection to the file is somewhat intermittent.
+
+```{r}
+#| label: load curvilinear model data
+
+if (file.exists(glue("{save_data}/curvilinear_data.csv"))){#if data exists read it in
+  
+  curvilinear_model <- read.csv(glue("{save_data}/curvilinear_data.csv")) |> 
+    mutate(Date = ymd(Date))
+  
+} else {#otherwise make it
+
+  #read in curvilinear data for as broad as dates as possible at 5m and at 0m for the pandora site
+  pan_curv_0m <- get_ereefs_ts(var_names = "Chl_a_sum", start_date = c(2020, 10, 16), input_file = "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml", layer = "surface",
+    end_date = c(2023, 02, 28), location_latlon = data.frame(latitude = -18.8168, longitude = 146.4346)) |> 
+    mutate(ID = "Pandora Curvilinear Model",
+           Chla = Chl_a_sum,
+           Date = date,
+           Freq = "Daily",
+           Depth = "0m",
+           Type = "Point",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  pan_curv_5m <- get_ereefs_ts(var_names = "Chl_a_sum", start_date = c(2020, 10, 16), input_file = "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml", layer = -5,
+    end_date = c(2023, 02, 28), location_latlon = data.frame(latitude = -18.8168, longitude = 146.4346)) |> 
+    mutate(ID = "Pandora Curvilinear Model", 
+           Chla = Chl_a_sum,
+           Date = date,
+           Freq = "Daily",
+           Depth = "5m",
+           Type = "Point",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  #read in curvilinear data for as broad as dates as possible at 5m and at 0m for the pelorus site
+  pel_curv_0m <- get_ereefs_ts(var_names = "Chl_a_sum", start_date = c(2020, 10, 16), input_file = "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml", layer = "surface",
+    end_date = c(2023, 02, 28), location_latlon = data.frame(latitude = -18.5406, longitude = 146.4886)) |> 
+    mutate(ID = "Pelorus Curvilinear Model", 
+           Chla = Chl_a_sum,
+           Date = date,
+           Freq = "Daily",
+           Depth = "0m",
+           Type = "Point",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  pel_curv_5m <- get_ereefs_ts(var_names = "Chl_a_sum", start_date = c(2020, 10, 16), input_file = "https://dapds00.nci.org.au/thredds/dodsC/fx3/GBR1_H2p0_B3p2_Cfur_Dnrt.ncml", layer = -5,
+    end_date = c(2023, 02, 28), location_latlon = data.frame(latitude = -18.5406, longitude = 146.4886)) |> 
+    mutate(ID = "Pelorus Curvilinear Model", 
+           Chla = Chl_a_sum,
+           Date = date,
+           Freq = "Daily",
+           Depth = "5m",
+           Type = "Point",
+           Hour = NA) |> 
+    select(ID, Date, Hour, Freq, Depth, Type, Chla)
+  
+  #bind everything together
+  curvilinear_model <- rbind(pan_curv_0m, pan_curv_5m, pel_curv_0m, pel_curv_5m)
+  
+  #save data
+  write.csv(curvilinear_model, glue("{save_data}/curvilinear_data.csv"), row.names = F)
+  
+  #clean up
+  rm(pan_curv_0m, pan_curv_5m, pel_curv_0m, pel_curv_5m)
+  
+}
+
+```
+
+## Everything together
+
+Then we can join everything together for a final complete file.
+
+```{r}
+#| label: join everything together
+
+if (file.exists(glue("{save_data}/all_data.csv"))){#if data exists, read it in
+  
+  all_data <- read.csv(glue("{save_data}/all_data.csv")) |> 
+    mutate(Date = ymd(Date))
+  
+} else {#otherwise make it
+
+  #bind datasets
+  all_data <- rbind(loggers, transformed_model, curvilinear_model)
+  
+  #save data
+  write.csv(all_data, glue("{save_data}/all_data.csv"), row.names = F)
+  
+}
+
+#clean up
+rm(loggers, transformed_model, curvilinear_model)
+
+```
+
+# Data Comparisons
+
+## Pandora
+
+Now we can begin the comparisons at the Pandora Site
+
+First we will look at Pandora MMP daily logger data at a depth of 5m vs. transformed model data at a depth of 0m vs. curvilinear model data at a depth of 0m for the time period 2023-02-05 to 2023-02-28.
+
+```{r}
+#| label: pandora 05 to 28 using 0m data
+
+#filter data to get what we want
+pandora_set_1 <- all_data |>  
+  filter(Type == "Point",
+         Freq == "Daily",
+         ID %in% c("Pandora Logger", "Pandora Curvilinear Model", "Pandora Transformed Model"),
+         between(Date, as.Date("2023-02-05"), as.Date("2023-02-28")),
+         !c(ID == "Pandora Curvilinear Model" & Depth == "5m"))
+
+#plot
+pandora_set_1 |> ggplot(aes(x = Date, y = Chla, group = ID, color = ID)) +
+  geom_line()
+
+```
+We can clearly see that for this time period both the curvilinear and transformed data underestimate Chla concentrations by roughly 50%, of secondary note is the one-day offset between the transformed data and the curvilinear data - which is otherwise almost exactly the same. But the difference is possibly just due to picking a poor time frame. We can use the curvilinear model data to extend our assessment to capture multiple years. While we are at it, we should also acknowledge that the MMP samples are taken at 5m depth, while the model data we are using is from the surface, so we will also obtain model data from 5m depth as well.
+
+(Note there is missing data in the logger from 2020 09 until 2021 02)
+ 
+```{r}
+#| label: pandora 2019 to 2022
+
+#filter data to get what we want
+pandora_set_2 <- all_data |> 
+  filter(Type == "Point",
+         Freq == "Daily",
+         ID %in% c("Pandora Logger", "Pandora Curvilinear Model"),
+         between(Date, as.Date("2020-10-16"), as.Date("2023-02-28"))) |> 
+  mutate(ID = case_when(str_detect(Depth, "5m") & str_detect(ID, "Curvi") ~ "Pandora Curvilinear Model 5m",
+                        str_detect(Depth, "0m") & str_detect(ID, "Curvi") ~ "Pandora Curvilinear Model 0m",
+                        T ~ ID))
+
+#plot
+pandora_set_2 |> ggplot(aes(x = Date, y = Chla, group = ID, color = ID)) +
+  geom_line()
+
+```
+That is noticeably better, however it seems recently (post mid 2022), it seems to be underestimating chla concentrations, potentially due to rapidly changing real world conditions that the model cant account for. Interestingly, the change in depth had little impact. It should be noted that this is for a very near-shore environment (lots and lots of confounding factors for the model to account for) and only for one cell. What if we were to look at an average of the surrounding area? Calculating the average for an area is alot easier using the transformed model so we will go back to that.
+
+```{r}
+#| label: pandora 05 to 28 using 0m data and area data
+
+#filter data to get what we want
+pandora_set_3 <- all_data |>
+  filter(Freq == "Daily",
+         ID %in% c("Pandora Logger", "Pandora Curvilinear Model", "Pandora Transformed Model"),
+         between(Date, as.Date("2023-02-05"), as.Date("2023-02-28")),
+         !c(ID == "Pandora Curvilinear Model" & Depth == "5m"),
+         !c(ID == "Pandora Transformed Model" & Type == "Point")) |> 
+  mutate(ID = case_when(str_detect(ID, "Trans") ~ "Pandora Transformed Model (Area)",
+                        T ~ ID))
+
+#plot
+pandora_set_3 |> ggplot(aes(x = Date, y = Chla, group = ID, color = ID)) +
+  geom_line()
+
+```
+Here we see that taking the average of an area 0.075 degrees around the point of interest doesn't seem to change things too much either from just the single point, only smoothing things out somewhat. What about for a logger in a different location? Keeping in mind that all loggers are relatively close to shore and will all be affected by the myriad of local dynamics that are very hard to model.
+
+## Pelorus
+
+Now we can begin the comparisons at the Pelorus Site
+
+First we will look at Pelorus MMP daily logger data at a depth of 5m vs. transformed model data at a depth of 0m vs. curvilinear model data at a depth of 0m for the time period 2023-02-05 to 2023-02-28. (The same as the first analysis we did at the Pandora Site).
+
+```{r}
+#| label: pelorus 05 to 28 using 0m data
+
+#filter data to get what we want
+pelorus_set_1 <- all_data |>  
+  filter(Type == "Point",
+         Freq == "Daily",
+         ID %in% c("Pelorus Logger", "Pelorus Curvilinear Model", "Pelorus Transformed Model"),
+         between(Date, as.Date("2023-02-05"), as.Date("2023-02-28")),
+         !c(ID == "Pelorus Curvilinear Model" & Depth == "5m"))
+
+#plot
+pelorus_set_1 |> ggplot(aes(x = Date, y = Chla, group = ID, color = ID)) +
+  geom_line()
+
+```
+Almost the exact same issue, although at least we can vaguely see that they are following a similar trend (lowest point mid Feb). To confirm this assessment we will complete the same two comparisons as we did above, one for a long period of time, and one for an area around the point.
+
+```{r}
+#| label: pelorus 2019 to 2022
+
+#filter data to get what we want
+pelorus_set_2 <- all_data |> 
+  filter(Type == "Point",
+         Freq == "Daily",
+         ID %in% c("Pelorus Logger", "Pelorus Curvilinear Model"),
+         between(Date, as.Date("2020-10-16"), as.Date("2023-02-28"))) |> 
+  mutate(ID = case_when(str_detect(Depth, "5m") & str_detect(ID, "Curvi") ~ "Pelorus Curvilinear Model 5m",
+                        str_detect(Depth, "0m") & str_detect(ID, "Curvi") ~ "Pelorus Curvilinear Model 0m",
+                        T ~ ID))
+
+#plot
+pelorus_set_2 |> ggplot(aes(x = Date, y = Chla, group = ID, color = ID)) +
+  geom_line()
+
+```
+
+```{r}
+#| label: pelorus 05 to 28 using 0m data and area data
+
+#filter data to get what we want
+pelorus_set_3 <- all_data |>
+  filter(Freq == "Daily",
+         ID %in% c("Pelorus Logger", "Pelorus Curvilinear Model", "Pelorus Transformed Model"),
+         between(Date, as.Date("2023-02-05"), as.Date("2023-02-28")),
+         !c(ID == "Pelorus Curvilinear Model" & Depth == "5m"),
+         !c(ID == "Pelorus Transformed Model" & Type == "Point")) |> 
+  mutate(ID = case_when(str_detect(ID, "Trans") ~ "Pelorus Transformed Model (Area)",
+                        T ~ ID))
+
+#plot
+pelorus_set_3 |> ggplot(aes(x = Date, y = Chla, group = ID, color = ID)) +
+  geom_line()
+
+```
+In this case we can see that the long term data does not line up as close, further suggesting the complexity and difficulty of inshore modelling. We also can't clearly see a divergence between real world and model in the later years the same way we can see at the Pandora site. For the area sample the finding are the same, sampling a small area around the point makes little difference other than to smooth at some of the more erratic changes in values (most of the time, sometimes it introduces new spikes!).
+
+The next thing to consider is a specific quirk of sampling. The MMP loggers actually record hourly data, and then the daily data is presented as the mean of this. However, per. comms. with Eric Lawrey (need to double check this), the models "daily" figure is actually a snapshot of midday conditions, rather than a mean of hourly conditions for the day. Therefore, perhaps discrepancies are due to the specific hour the sample is taken.
+
+Below we look at intra-day details, first we will pick a random day and see how values change each hour.
+
+```{r}
+#| label: pelorus intra day single
+
+#filter to get what we want
+pelorus_set_4 <- all_data |> 
+  filter(Freq == "Hourly",
+         Date == as.Date("2023-02-05"))
+
+#plot
+pelorus_set_4 |> ggplot(aes(x = Hour, y = Chla, group = ID, color = ID)) +
+  geom_line() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1))
+
+```
+Clearly there is a significant difference in Chla concentrations depending on the time of day, but again, this might just be a quirk of the specific date chosen. Thus we will take all days and get the mean of each hour. For context we will also overlay the day mean, to understand how that would look in comparison.
+
+```{r}
+#| label: pelorus intra day multiple
+
+#filter to get what we want
+pelorus_set_5 <- all_data |> 
+  filter(Freq == "Hourly") |> 
+  group_by(ID, Hour) |> summarise(Chla = mean(Chla)) |> ungroup()
+
+total_chla <- mean(pelorus_set_5$Chla)
+
+#plot
+pelorus_set_5 |> ggplot(aes(x = Hour, y = Chla, group = ID, color = ID)) +
+  geom_line() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1)) +
+  geom_hline(yintercept = total_chla)
+
+
+```
+Very interesting, the intra-day trend definitely exists, and it looks like midday is on average the point of lowest Chla concentration. Compared to taking the average for the day there is about a difference of 0.06. Unfortunately, while this graph looks significant, the difference between the model data and real world logger data is somewhere around 0.2 to 0.4 (roughly 4x - 6x magnitude), so a change of 0.06 doesn't quite cut it.
+
+Regardless, lets take a look at how the logger data compares to the model data, if we exclusively get out logger data at midday.
+
+```{r}
+#| label: pelorus only midday
+
+#filter to get what we want
+pelorus_set_6_part_1 <- all_data |> 
+  filter(Freq == "Hourly",
+         Hour == "12:00:00") |> 
+  mutate(ID = "Pelorus Logger Midday Only")
+
+pelorus_set_6_part_2 <- all_data |> 
+  filter(ID == "Pelorus Logger",
+         Freq == "Daily") |> 
+  mutate(ID = "Pelorus Logger Daily")
+
+pelorus_set_6_part_3 <- all_data |> 
+  filter(ID == "Pelorus Curvilinear Model",
+         Depth == "5m")
+
+pelorus_set_6 <- rbind(pelorus_set_6_part_1, pelorus_set_6_part_2, pelorus_set_6_part_3) |> 
+  filter(between(Date, as.Date("2020-10-16"), as.Date("2023-02-28"))) 
+
+#plot
+pelorus_set_6 |> ggplot(aes(x = Date, y = Chla, group = ID, color = ID)) +
+  geom_line()
+
+```
+Again, no massive change is visible, but it does reduce the gap somewhat.
+
+To summarise/confirm where we are at now, both model and logger are now sampling at 5m, both are sampling at midday, both are sampling total chlorophyll, both are using the same units, and both are in the same spot.
+
+Thus differences are a result of (i am assuming) the extreme difficulty in modelling the near shore environment.
+
+# Session Info {#sec-sessioninfo}
+
+Below is the session info at the time of rendering this script. Of greatest importance is to note the R version, and the "other attached packages" as these are the most significant drivers of success/failure. It is also good to check the "attached base packages" and "loaded via a namespace" packages as well. To check your session info use `sessionInfo()`.
+
+```{r}
+#| label: show session info
+
+sessionInfo()
+
+```
+

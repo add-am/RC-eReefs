@@ -1,0 +1,607 @@
+---
+title: "eReefs Contextual Results - Plotting"
+subtitle: "A Healthy Waters Partnership Analysis"
+description: "This script has been written to create a series of contextual results to be included in the Offshore Marine Zone of the Technical Report."
+author: "Adam Shand" 
+format: html
+params:
+  project_crs: "EPSG:7844"
+  target_fyear: 2023
+  target_region: "Dry Tropics"
+  resolution: 0 #0 is full size, bigger number = more cells merge together
+  buffer: 1.2 #how much "extra" of the model do we want to get outside of the focus area
+---
+
+::: {.callout-note}
+This is one part of several scripts exploring CSIRO ereefs data. 
+:::
+
+# Introduction
+
+The objective of this script is to produce a series of plots of eReefs data. Each plot contains:
+
+ - A dot plot that graphs individual cell values (500 random cell values are selected per day). Dots are coloured per wet season/dry season
+ - A line plot (smoothed using a GAM) that graphs daily values over time
+ - A violin plot (using all data) that identifies region of high density that the volume of points can hide
+ - An annual mean and annual median line
+
+ The user defines a series of inputs to control how many plots are created, and the length of time that is plotted. The user can control:
+
+  - The number of regions to plot
+  - The number of variables to plot
+  - The length of time to plot
+
+For example, the user could request:
+
+ 1. A single year of chlorophyll a data in the Dry Tropics region
+    - Resulting in a singular plot
+ 2. A 3-year span of chlorophyll a, turbidity, and DIN, in both the Dry Tropics Region, and the Wet Tropics Region,
+    - Years are combined on the x axis
+    - Variables (chla, turbidity, etc.) are faceted as new rows
+    - Regions are faceted as new columns
+    - Resulting in 6 individual plots grouped into one image
+
+This control is achieved by suppling the following inputs:
+
+ - Region(s)
+ - Financial Year(s)
+ - Variable(s)
+
+However, the user must also supply the following inputs related to the resolution and extent of the data, these inputs define what data is selected for plotting:
+
+ - Downsample (in reference to the resolution of the data)
+ - Buffer (in reference to any addtional extent around the region)
+
+ The user must supply **at least one of each**, however could choosen to provide several. The following cheatsheet has been supplied for common inputs:
+
+| Input      | Full Names/Context                                                        | Text to Supply To Script                                  |
+| ---------- | ------------------------------------------------------------------------- | --------------------------------------------------------- |
+| Region     | Dry Tropics, Wet Tropics, Burdekin, Mackay Whitsunday Issac               | DT, WT, BD, MWI                                           |
+| FYear      | 2019-20, 2020-21, 2021-22, 2022-23, 2023-24                               | 2020, 2021, 2022, 2023, 2024                              |
+| Variable   | Turbidity, Chlorophyll a, DIN, Ammonium, Nitrate, Secchi Depth, pH, Wind  | Turbidity, Chlorophyll a, DIN, NH4, NO3, Secchi, pH, Wind |
+| Downsample | 0-10, integer (no decimal), increasing by 1 each time                     | 0 - 10*                                                   |
+| Buffer     | Yes, No                                                                   | Y, N**                                                    |
+
+* Downsample indicates the amount cell aggregation, with 0 being 0 cells aggregated and 10 being 10 cells in each direction combined into a single cell.
+** Buffer indicates the additional extent outside the region to the edge of the maps, Yes means include this extra area, No means do not.
+
+The data associated with the exact combination of region, financial year, variable, downsample, and buffer must be present on the local machine for the plot to be created.
+
+# Script Set Up
+
+This script requires multiple core spatial packages, each of which is loaded below. Key variables and paths are also created.
+
+```{r}
+#| label: load packages
+
+#use pacman function to load and install (if required) all other packages
+pacman::p_load(tidyverse, glue, here, stars, purrr, scales, climaemet)
+
+#build data and output path manually (it is just easier in this case)
+data_path <- here("data/02. northern_three/n3_ereefs_contextual-results/")
+output_path <- here("outputs/02. northern_three/n3_ereefs_contextual-results/plots/")
+dir.create(output_path)
+
+#turn off spherical geometry
+sf_use_s2(FALSE)
+
+```
+
+# Load Data
+
+This script uses data produced by script 1, if the dataset you wish to plot is not found in the local folder, return to script 1.
+
+## Verify User Inputs
+
+First, the user inputs are verified:
+
+```{r}
+
+#manually enter user inputs to begin with for testing:
+u_in <- list(
+  u_in_reg = c("MWI"),
+  u_in_year = c(2020, 2021, 2022, 2023, 2024),
+  u_in_var = c("Turbidity", "Chlorophyll a", "DIN", "NH4", "NO3", "Secchi", "pH", "Wind"),
+  u_in_ds <- 0,
+  u_in_bf <- "N")
+
+#name each item in the list
+names(u_in) <- c("Region", "FYear", "Variable", "Downsample", "Buffer")
+
+#build vectors of supported inputs
+u_in_supported <- list(
+  reg_supported = c("DT", "WT", "BD", "MWI"),
+  fyear_supported = c(2020, 2021, 2022, 2023, 2024),
+  var_supported = c("Turbidity", "Chlorophyll a", "DIN", "NH4", "NO3", "Secchi", "pH", "Wind"),
+  ds_supported = seq(0,10,1),
+  bf_supported = c("Y", "N"))
+
+#name each item in the list
+names(u_in_supported) <- c("Region", "FYear", "Variable", "Downsample", "Buffer")
+
+#for each item in the two lists, compare and record differences
+compare_inputs <- map2(u_in, u_in_supported, setdiff)
+
+#remove any instances where there are no differences
+compare_inputs <- flatten(compare_inputs)
+
+#flag all instances where there are differences and warn the user
+if (length(compare_inputs) > 0){
+  for (i in 1:length(compare_inputs)){
+
+    wrong_input <- compare_inputs[[i]]
+
+    input_type <- str_to_lower(names(compare_inputs[i]))
+
+    input_options <- paste(u_in_supported[[names(compare_inputs[i])]], collapse = ", ")
+
+    stop(glue('The "{wrong_input}" {input_type} input is not currently supported, try one of: "{input_options}"'))
+  }
+} else {print("All user inputs supported.")}
+
+```
+
+## Expand Variable Inputs
+
+If the user has requested "wind" this relates to four variables:
+
+```{r}
+
+#if wind requested
+if (any(str_detect(u_in[["Variable"]], "Wind"))){
+
+  #update the variable inputs
+  u_in[["Variable"]] <- c(
+    str_replace(u_in[["Variable"]], "Wind", "Wind Direction"),
+    "Wind Stress",
+    "Wind U Component",
+    "Wind V Component")
+}
+
+```
+
+## Open Local Datasets
+
+Then the data is confirmed to be on the local machine, and loaded in:
+
+```{r}
+
+#create a table that tracks all user inputs.
+all_user_inputs <- expand.grid(u_in, stringsAsFactors = F)
+
+#using the same user inputs df
+requested_data <- pmap(all_user_inputs, \(Region, FYear, Variable, Downsample, Buffer) {
+
+  #create a filename using the human readable variable names
+  file_name <- str_to_lower(
+    str_replace_all(
+      string = glue("{Region}_{FYear}_{Variable}_ds-{Downsample}_bf-{Buffer}"),
+      pattern = " ",
+      replacement = "-"
+    )
+  )
+
+  #if exists, load it in
+  if (any(file.exists(glue("{data_path}/{file_name}.{c('nc', 'RData')}")))){
+    if (Region == "MWI"){data <- readRDS(glue("{data_path}/{file_name}.RData"))}
+    if (Region != "MWI"){data <- read_mdim(glue("{data_path}/{file_name}.nc"))}
+  } else {stop(glue("The {file_name} file does not exist, return to script 1."))}
+
+  #return the datafile as the final output of the map function
+  return(data)
+
+})
+
+#extract the name of each file
+item_names <- pmap(all_user_inputs, \(Region, FYear, Variable, Downsample, Buffer){
+  str_to_lower(
+    str_replace_all(
+      string = glue("{Region}_{FYear}_{Variable}_ds-{Downsample}_bf-{Buffer}"),
+      pattern = " ",
+      replacement = "-"
+    )
+  )
+})
+
+#rename items in the data list
+names(requested_data) <- item_names
+
+```
+
+
+## Prepare Data
+
+### Address Data Buffer
+
+If the user is pulling a buffered data, the data outside of the region should still be removed to stay "true" to what the value inside the region should be:
+
+```{r}
+
+#if the user has requested a buffered dataset we will need to crop the data
+if (u_in[["Buffer"]] == "Y"){
+
+  #load in the n3 region
+  n3_region <- st_read(here("outputs/01. core/n3_prep_region-builder/n3_region.gpkg")) |> 
+    st_transform("EPSG:7855")
+
+  requested_data <- map2(requested_data, names(requested_data), \(x, y) {
+
+    #figure out which region is currently being processed
+    region_being_processed <- str_extract(y, ".{2}")
+
+    #use a key to convert that to a filterable variable
+    region_key <- c(
+      "dt" = "Dry Tropics",
+      "wt" = "Wet Tropics",
+      "bd" = "Burdekin",
+      "mwi" = "Mackay Whitsunday Isaac"
+    )
+      
+    #filter the data to select the region requested by the user
+    selected_region <- n3_region |> 
+      filter(Region %in% unname(region_key[region_being_processed]),
+            Environment == "Marine") |> 
+      group_by(Region, SubBasinOrSubZone) |> 
+      summarise(geometry = st_union(geom)) |> 
+      ungroup() |> st_cast() |> 
+      st_make_valid()
+
+    #use this to crop the dataset
+    cropped_x <- st_crop(x, selected_region)
+
+    #return the cropped object
+    return(cropped_x)
+  })
+
+}
+
+```
+
+### Combine Years
+
+If several years of data have been requested, these need to be combined (noting the dataset**s** are combined, the year information is still preserved):
+
+```{r}
+
+#if user has supplied more than one year
+if (length(u_in[["FYear"]]) > 1) {
+
+  #drop year from the user inputs table, then select unique rows
+  unique_u_in_san_year <- all_user_inputs |> 
+    select(!FYear) |> 
+    unique() |> 
+    mutate(across(is.character, str_to_lower),
+           Variable = str_replace_all(Variable, " ", "-"))
+
+  #cycle through the supplied datasets to combine years that share a region, variable, and downsample
+  requested_data <- pmap(unique_u_in_san_year, \(Region, Variable, Downsample, Buffer){
+
+    #create a logical vector that returns T for datasets that match the search
+    matched_data_lgl <- map_lgl(names(requested_data), \(x) all(str_detect(x, c(Region, Variable, Downsample, Buffer))))
+
+    #use the logical vector to pull the associated datasets and combine them into one dataset
+    data <- do.call(c, c(requested_data[matched_data_lgl], list(along = "time")))
+
+    #use the same logical vector to pull date values associated with each of the datasets
+    data_dates <- do.call(c, c(map(requested_data[matched_data_lgl], \(x) st_get_dimension_values(x, "time"))))
+    
+    #update the date values in the compressed dataset
+    st_dimensions(data)$time$values <- data_dates
+
+    #return the compressed dataset as the final argument of this map function
+    return(data)
+  })
+}
+
+#note if only one year of data, nothing is done, if more than one year, the original object is overwritten
+
+#if user has supplied more than one year then the list of datasets will need to be renamed again
+if (length(u_in[["FYear"]]) > 1) {
+
+  #extract the name of each file
+  item_names <- pmap(unique_u_in_san_year, \(Region, Variable, Downsample, Buffer){
+    str_to_lower(
+      str_replace_all(
+        string = glue("{Region}_{Variable}_ds-{Downsample}_bf-{Buffer}"),
+        pattern = " ",
+        replacement = "-"
+      )
+    )
+  })
+
+  #rename items in the data list
+  names(requested_data) <- item_names
+
+}
+
+```
+
+### Convert to SF
+
+Datasets can then be converted from stars objects into sf objects (required by ggplot), season is also added. Due to the sheer volume of points, a subset is used to speed up the process. The standard subset is a random selection of 500 points per day, however this can be adjusted. If the raw data has less than 500, the full dataset is used instead:
+
+```{r}
+
+#create a custom function to convert data from nc to sf and take a sub sample if needed
+convert_nc_to_sf <- function(dataset, FileName, sample_size = 500){
+  
+  #convert raster to a polygon dataset
+  dataset_df <- st_as_sf(dataset, as_points = F, merge = F)
+  
+  #drop the geometry column
+  dataset_df <- st_drop_geometry(dataset_df)
+
+  #if subset amount is greater than the original update sample size to equal row number
+  if (sample_size > nrow(dataset_df)) { sample_size <- nrow(dataset_df) }
+    
+  #create a function that picks random rows per column, if sample == row, this just selects all rows
+  sampled_data <- map(dataset_df, \(x){ n_row_indices <- sample(x, sample_size) })
+        
+    #randomly pick n cell per column
+    #n_row_indices <- sample(x, sample_size)
+        
+    #return the result
+    #return(n_row_indices)
+
+  #})
+
+  #bind this back into a dataframe (overwrite original)
+  dataset_df <- as.data.frame(do.call(cbind, sampled_data))
+  
+  #pivot the data longer
+  dataset_df <- dataset_df |> 
+    pivot_longer(cols = everything(), names_to = "Day", values_to = "Values")
+  
+  #make sure the day column is formatted correctly
+  dataset_df$Day <- as.Date(dataset_df$Day)
+  
+  #add a dataset identifier using the second variable in the function
+  dataset_df <- dataset_df |> 
+    mutate(FileName = FileName)
+  
+  #remove units from the values column
+  dataset_df <- dataset_df |> 
+    mutate(Values = as.vector(Values))
+  
+  #add a wet/dry column to group data by 
+  dataset_df <- dataset_df |> 
+    mutate(Season = case_when(month(Day) > 4 & month(Day) < 11 ~ "Dry", T ~ "Wet"))
+
+  #divide the grouping column into several columns
+  dataset_df <- dataset_df |> 
+    separate_wider_delim(
+      cols = FileName, 
+      delim = "_", 
+      names = c("Region", "Year", "Variable", "Downsample", "Buffer"),
+      too_few = "align_end",
+      cols_remove = FALSE)
+  
+  #in the case when year was combined, this will mean that year was not in the filename. Due to align_end, this will put "Region" under "Year"
+  if(all(is.na(dataset_df$Region))){
+
+    dataset_df <- dataset_df |> 
+      mutate(Region = Year) |> 
+      select(!Year)
+  }
+  
+  #return the df
+  return(dataset_df)
+  
+}
+
+#run the function
+requested_df <- map2(requested_data, names(requested_data), ~convert_nc_to_sf(.x, .y))
+ 
+#convert list of df into a single df
+requested_df <- bind_rows(requested_df)
+
+```
+
+### Log Scale Variables
+
+Some variables are better viewed on a log scale, however not all variables require this treatment. Given that facet wrapped ggplots can only show one type of y scale at a time (either log or linear), the data that requires a log scale is pre-transformed, then presented with a linear axis:
+
+```{r}
+
+#create a vector listing the variables that should be transformed
+var_to_tran <- c("turbidity", "chlorophyll-a", "din", "nh4", "no3")
+
+#create a second vector for variables that shouldnt be transformed. Note this isn't normally required but will help us flag if a variable doesn't have a rule
+var_to_keep <- c("secchi", "ph", "wind-direction", "wind-stress", "wind-u-component", "wind-v-component")
+
+#apply a log10 transformation to values that need it, then rescale those values to have a min value of zero
+requested_df <- requested_df |> 
+  mutate(
+    Values = case_when(
+      Variable %in% var_to_tran ~ log10(Values),
+      Variable %in% var_to_keep ~ Values,
+      T ~ Values
+    ),
+    Values = case_when(
+      Variable %in% var_to_tran ~ Values - min(Values),
+      Variable %in% var_to_keep ~ Values,
+      T ~ Values
+    )
+  )
+
+#get a vector of all unique variable names
+var_that_exist <- unique(requested_df$Variable)
+
+#check if any of the variables didn't have a specific rule
+has_rule <- !var_that_exist %in% c(var_to_tran, var_to_keep)
+
+#catch any that don't have their own transformation rule
+if (any(has_rule)){stop(glue("The {test[c(has_rule)]} variable(s) do not have transformation rules applied to them. They have not been transformed, however it is reccomended the code is reviewed to confirm this is the desired behaviour."))}
+
+```
+
+### Beautify Names
+
+Before plotting it is a good idea to make sure the text that will appear in the plot looks good:
+
+```{r}
+
+#create a named list that translates each variable, this contains the file name, and the attribute name (with units) from the original data
+var_beauty <- map(requested_data, names)
+
+#update variable names based on the original file name
+requested_df$`Full Variable` <- map_chr(requested_df$FileName, \(x) var_beauty[[x]])
+
+#create another named list that translate each region
+reg_beauty <- list(
+  "dt" = "Dry Tropics",
+  "wt" = "Wet Tropics",
+  "bd" = "Burdekin" ,
+  "mwi" = "Mackay Whitsunday Isaac"
+)
+
+#update variables to also contain their units
+requested_df$Region <- map_chr(requested_df$Region, \(x) reg_beauty[[x]])
+
+```
+
+### Separate Wind Data
+
+If wind data is included in the requested data it needs to be split off from the main dataset, this is because the direction data does not make sense in a line plot (values are 0 to 360 degrees). However, the wind stress data can be plotted, so it will be duplicated across the two datasets.
+
+:::{.callout-note}
+Note, wind stress is the sheer stress exerted on the surface of the ocean. Values typically range from 0 to 1, with anything greater than 0.3 equalling a pretty hefty breeze.
+:::
+
+```{r}
+
+#check if wind data is present
+if (any(str_detect(unique(requested_df$Variable), "wind"))){
+
+  #duplicate the dataset
+  requested_df_wind <- requested_df
+
+  #in the wind df, only keep wind
+  requested_df_wind <- requested_df_wind |> 
+    filter(str_detect(Variable, "wind"))
+
+  #in the main df, drop the direction data
+  requested_df <- requested_df |> 
+    filter(!str_detect(Variable, "direction"))
+
+}
+
+```
+
+# Plot Data
+
+Data is now ready to be plotted. As noted earlier:
+
+ - Years are combined and simply extend the width of a plot
+ - One region, one variable = one plot
+ - One region, two variables = plots faceted by row
+ - Two regions, one variable = plots faceted by column
+ - Two regions, two variables = plots faceted by row and column
+ - etc.
+
+Noting that due to the high flexibity in the number of plots, it is prudent to first calculate some dimensions based on the number of facets expected:
+
+```{r}
+
+#count the number of Variables, this will influence the number of rows, then calculate the desired height of the final plot
+plot_h <- length(unique(requested_df$Variable))*2.5
+
+#count the number of Regions, this will influence the number of columns, then calculate the desired width of the final plot
+plot_w <- length(unique(requested_df$Region))*6
+
+#calculate region*variable mean values to use for the yintercept line from the full dataset
+group_means <- requested_df |>
+  group_by(Region, `Full Variable`) |> 
+  summarise(MeanValue = mean(Values, na.rm = T)) |> 
+  ungroup()
+    
+#create the plot, this contains a point plot, a smoothed line plot, and a volin plot
+summary_plot <- ggplot() +
+  geom_point(
+    data = requested_df,
+    aes(x = Day, y = Values, color = Season), 
+    size = 0.1) +
+  geom_smooth(
+    data = requested_df,
+    aes(x = Day, y = Values), 
+    method = "gam", 
+    formula = y ~ s(x), 
+    color = "blue", 
+    se = F) +
+  geom_violin(
+    data = requested_df,
+    aes(x = Day, y = Values), 
+    alpha = 0.5, 
+    color = "Black") +
+  geom_hline(
+    data = group_means, 
+    aes(yintercept = MeanValue), 
+    color = "purple") +
+  scale_x_date(breaks = pretty_breaks(6)) +
+  labs(x = "Date", y = "Concentration") +
+  theme(
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    legend.position = "none") +
+  facet_grid(
+    rows = vars(`Full Variable`),
+    cols = vars(Region),
+    scales = "free")
+
+#build the file name based on the data int contains
+f_reg <- glue_collapse(glue('{unique(str_extract(requested_df$FileName, ".{2}"))}'), sep = "-")
+f_var <- glue_collapse(glue('{str_extract(unique(requested_df$Variable), ".{3}")}'), sep = "-")
+f_year <- glue("{year(min(requested_df$Day))}-{year(max(requested_df$Day))}")
+f_ds_bf <- glue("{unique(requested_df$Downsample)}_{unique(requested_df$Buffer)}")
+save_f_name <- glue("{f_reg}_{f_var}_{f_year}_{f_ds_bf}")
+
+#save the individual plots
+ggsave(glue("{output_path}/{save_f_name}.png"), summary_plot, width = plot_w, height = plot_h)
+
+```
+
+Following this we can then create a windrose plot for the dataset, this requires both the sheer stress data (basically the speed/force of the wind on the surface of the ocean), and the direction data.
+
+```{r}
+
+#install.packages("climaemet")
+#(loaded at top of package)
+
+#check if wind data is present
+if (exists("requested_df_wind")){
+
+  #filter data for just magnitude and direction
+  wind_data <- requested_df_wind |> 
+    filter(Variable %in% c("wind-stress", "wind-direction")) |> 
+    select(Day, Variable, Values, Region) |> 
+    group_by(Day, Variable, Region) |> 
+    summarise(Values = mean(Values)) |> 
+    ungroup() |> 
+    pivot_wider(names_from = Variable, values_from = Values)
+
+  #create the windrose
+  wind_plot <- ggwindrose(
+    speed = wind_data$`wind-stress`,
+    direction = wind_data$`wind-direction`,
+    n_directions = 16,
+    n_speeds = 10,
+    stack_reverse = TRUE,
+    plot_title = "Wind Sheer Stress",
+    legend_title = "Sheer Stress (Nm^2)",
+    facet = wind_data$Region
+  )
+
+  #save the individual plots
+  ggsave(glue("{output_path}/{save_f_name}_wind-rose.png"), wind_plot)
+
+}
+
+```
+
+This concludes the data plotting script.
+
+```{r}
+
+#just to access the "run above" button
+
+```
