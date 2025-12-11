@@ -1,6 +1,6 @@
 # NetCDF Files
-.nc
-.RData
+*.nc
+*.RData
 
 # History files
 .Rhistory
