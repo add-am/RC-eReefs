@@ -65,7 +65,7 @@ This script requires multiple core spatial packages, each of which is loaded bel
 pacman::p_load(here, purrr, tidyverse, stringr, sf, glue, ereefs, stars, ncmeta)
 
 #build data save path manually (it is just easier in this case)
-data_path <- here("data/02. northern_three/n3_ereefs_contextual-results/")
+#data_path <- here("data/n3_ereefs_contextual-results/")
 
 #turn off spherical geometry
 sf_use_s2(FALSE)
@@ -80,10 +80,10 @@ The first step is to verify all of the requested user inputs are valid and suppo
 
 #manually enter user inputs to begin with for testing:
 u_in <- list(
-  u_in_reg = c("MWI"),
+  u_in_reg = c("DT"),
   u_in_year = c(2020),#, 2021, 2022, 2023, 2024),
-  u_in_var = c(#"Turbidity", "Chlorophyll a", "DIN", 
-  "Wind"),
+  u_in_var = c("Turbidity"), #"Chlorophyll a", "DIN", 
+  #"Wind"),
   u_in_ds <- 6,
   u_in_bf <- "N")
 
@@ -133,7 +133,7 @@ First we will need to define the region boundaries:
 ```{r}
 
 #load in the n3 region
-n3_region <- st_read(here("outputs/01. core/n3_prep_region-builder/n3_region.gpkg"))
+n3_region <- st_read(here("data/n3_region.gpkg"))
 
 #refine the object to make the next step easier
 n3_region <- n3_region |> 
