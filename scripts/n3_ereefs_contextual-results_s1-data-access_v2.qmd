@@ -4,12 +4,6 @@ subtitle: "A Healthy Waters Partnership Analysis"
 description: "This script has been written to create a series of contextual results to be included in the Offshore Marine Zone of the Technical Report."
 author: "Adam Shand" 
 format: html
-params:
-  project_crs: "EPSG:7844"
-  target_fyear: 2023
-  target_region: "Dry Tropics"
-  resolution: 0 #0 is full size, bigger number = more cells merge together
-  buffer: 1.2 #how much "extra" of the model do we want to get outside of the focus area
 ---
 
 ::: {.callout-note}
@@ -20,66 +14,29 @@ This is one part of several scripts exploring CSIRO ereefs data.
 
 The only objective of this script is to download data from the eReefs platform. For detailed explanations of this process, refer to earlier scripts such as ereefs script 6 (found in the archives).
 
-This script will take several inputs:
+A pair of custom functions have been written to assist in the data download and can be accessed from the RcTools package. The custom functions currently give access to the following variables:
 
- - Region(s)
- - Financial Year(s)
- - Variable(s)
- - Downsample
- - Buffer
+ - Turbidity
+ - Chlorophyll a
+ - DIN
+ - NH4
+ - NO3
+ - Secchi Depth
+ - PH
+ - Wind
 
-The user must supply **at least one of each**, however could choosen to provide several. The following cheatsheet has been supplied for common inputs:
+You define the area to extract data from using an [sf object](https://r-spatial.github.io/sf/) and you define the time frame by providing a start and end date in the format "YYYY-MM-DD".
 
-| Input      | Full Names/Context                                                        | Text to Supply To Script                                  |
-| ---------- | ------------------------------------------------------------------------- | --------------------------------------------------------- |
-| Region     | Dry Tropics, Wet Tropics, Burdekin, Mackay Whitsunday Issac               | DT, WT, BD, MWI                                           |
-| FYear      | 2019-20, 2020-21, 2021-22, 2022-23, 2023-24                               | 2020, 2021, 2022, 2023, 2024                              |
-| Variable   | Turbidity, Chlorophyll a, DIN, Ammonium, Nitrate, Secchi Depth, pH, Wind  | Turbidity, Chlorophyll a, DIN, NH4, NO3, Secchi, pH, Wind |
-| Downsample | 0-10, integer (no decimal), increasing by 1 each time                     | 0 - 10*                                                   |
-| Buffer     | Yes, No                                                                   | Y, N**                                                    |
+# Extract eReefs Data
 
-* Downsample indicates the amount cell aggregation, with 0 being 0 cells aggregated and 10 being 10 cells in each direction combined into a single cell.
-** Buffer indicates the additional extent outside the region to the edge of the maps, Yes means include this extra area, No means do not.
-
-:::{.callout-warning}
-The more region, financial year, and variable inputs supplied, the longer the script will take to process. To improve processing the data will be saved to your local computer and reloaded next time (approximate 30 seconds). 
-:::
-
-:::{.callout-note}
-The selection of "years" is mildly confusing as file dates are based on when loggers where deployed/retrieved in the field - and are not based on any logical "cut-off" day. Thus some files may extend across two years. Files are selected based on their **start** date, if the deployment started on the 30th of December 2023 and went until April 2024, the deployment is considered to be 2023. Below is a simple reference figure:
-
-![](/references/images/n3_ereefs_contextual_results_s1-data-access/logger_deployments_over_years.png)
-:::
-
-# Script Set Up
-
-This script requires multiple core spatial packages, each of which is loaded below. Key variables and paths are also created.
-
-```{r}
-#| label: load packages
-
-#if this packages need to be installed:
-#remotes::install_github("open-aims/ereefs")
-
-#use pacman function to load and install (if required) all other packages
-pacman::p_load(here, purrr, tidyverse, stringr, sf, glue, ereefs, stars, ncmeta)
-
-#build data save path manually (it is just easier in this case)
-#data_path <- here("data/n3_ereefs_contextual-results/")
-
-#turn off spherical geometry
-sf_use_s2(FALSE)
-
-```
-
-## Extract eReefs Data
-
-The following code will use the extraction dataframe to check if the data is saved locally, if it is not local it will download it and save it locally.
+The following code is all that is required to extract eReefs data:
 
 ```{r}
 
-pak::pak("add-am/RcTools")
+#update RcTools package if needed
+#pak::pak("add-am/RcTools")
 
+#load packages
 library(RcTools)
 library(sf)
 library(dplyr)
@@ -90,7 +47,7 @@ my_sf_object <- st_read("data/n3_region.gpkg") |>
   filter(Region == "Dry Tropics", Environment == "Marine")
 
 #read data in using custom function
-test_data <- ereefs_extract(
+turbidity_data <- ereefs_extract(
   Region = my_sf_object, 
   StartDate = "2022-01-01", 
   EndDate = "2022-01-05", 
@@ -98,7 +55,38 @@ test_data <- ereefs_extract(
 )
 
 #convert from curvilinear to regular grid using custom function
-test_data_reg <- ereefs_reproject(test_data)
+turbidity_data <- ereefs_reproject(turbidity_data)
+
+```
+
+# Generalised Extraction
+
+Below is the code necessary to generalise the data extraction, simply create a matrix of input values and use pmap
+
+```{r}
+
+#put arguments into objects
+all_variables <- c("Turbidity", "Chl_a_sum")
+all_start_dates <- "2022-01-01"
+all_end_dates <- "2022-01-05"
+
+#use expand grid
+all_arguments <- expand.grid(all_variables, all_start_dates, all_end_dates, stringsAsFactors = F)
+
+#map over each argument, this returns a list of data extracts
+test_extract <- purrr::pmap(all_arguments,  function(Var1, Var2, Var3){ereefs_extract(my_sf_object, Var2, Var3, Var1)})
+
+#alternatively, you can manually build the table if you want more control (note that two different time spans are requested)
+all_arguments_2 <- data.frame(
+  "AllVariables" = c("Turbidity", "Chl_a_sum", "Turbidity", "Chl_a_sum"),
+  "AllStartDates" = c("2022-01-01", "2022-01-01", "2023-01-01", "2023-01-01"),
+  "AllEndDates" = c("2022-01-05", "2022-01-05", "2023-01-05", "2023-01-05")
+)
+
+```
+
+
+```{r}
 
 #how to save data
 stars::write_mdim(final_data, "final.nc")
@@ -106,75 +94,12 @@ stars::write_mdim(final_data, "final.nc")
 #how to read data back in
 read_back_in <- stars::read_stars("final.nc")
 
-#using the same user inputs df
-pmap(all_user_inputs, \(Region, FYear, Variable, Downsample, Buffer) {
-
-
-
-  #create a filename using the human readable variable names
-  file_name <- str_to_lower(
-    str_replace_all(
-      string = glue("{Region}_{FYear}_{Variable}_ds-{Downsample}_bf-{Buffer}"),
-      pattern = " ",
-      replacement = "-"
-    )
-  )
-
-  #search for the file, if it exists locally, do nothing, otherwise download and save the data locally. Note MWI files are saved as RData
-  if (any(file.exists(glue("{data_path}/{file_name}.{c('nc', 'RData')}")))){
-    
-  } else {
-
-
-
-    #if the region is MWI, then we can't convert data from curvilinear to rectilinear for a bunch of reasons... so we just dont!
-    if (Region == "MWI"){
-
-      #drop the depth dimension as this only has one layer
-      nc_data <- nc_data[drop = TRUE]
-
-      #save the data as an R object (note, this is much less efficent)
-      saveRDS(nc_data, file = glue("{data_path}/{file_name}.RData"))
-
-      #save the data locally as an R object rather than a 
-      #write_mdim(x = nc_data, filename = glue("{data_path}/{file_name}_copy.nc"))
-
-    } else {
-      
-      #update the crs on the data (move from lat long to meters)
-      nc_data <- nc_data |> st_transform("EPSG:7855")
-
-      #convert our curvilinear object into just a bbox
-      curvilinear_bbox <- nc_data |> 
-        st_bbox() |>
-        st_as_sfc()
-
-      #get a linear grid target with the same dimensions (number of cells) as our curvilinear grid 
-      reg_stars <- st_as_stars(
-        curvilinear_bbox, #using the bbox to provide the xmin, xmax etc., 
-        nx = dim(nc_data)[[1]], #and the dimensions to provide the x and y count. 
-        ny = dim(nc_data)[[2]], 
-        values = NA_real_) #Fill each cell with NA
-
-      #run st warp, it requires a curvilinear object, and a regular object as a target
-      warped_data <- st_warp(nc_data, reg_stars)
-
-      #drop the depth dimension as this only has one layer
-      final_data <- warped_data[drop = TRUE]
-
-      #save the data locally
-      write_mdim(x = final_data, filename = glue("{data_path}/{file_name}.nc"))
-    }
-  }
-})
+  
 
 ```
 
 This concludes the data access script.
 
 ```{r}
-
-#just to access the "run above" button2
-
 
 ```
