@@ -40,10 +40,14 @@ The following code is all that is required to extract eReefs data:
 library(RcTools)
 library(sf)
 library(dplyr)
+library(stringr)
 library(tmap)
+library(purrr)
+library(stars)
+library(here)
 
 #make an sf object that defines the broad boundary of where to extract data from
-my_sf_object <- st_read("data/n3_region.gpkg") |> 
+my_sf_object <- st_read(here("data/n3_region.gpkg")) |> 
   filter(Region == "Dry Tropics", Environment == "Marine")
 
 #read data in using custom function
@@ -59,9 +63,9 @@ turbidity_data <- ereefs_reproject(turbidity_data)
 
 ```
 
-# Generalised Extraction
+# Multiple Extraction
 
-Below is the code necessary to generalise the data extraction, simply create a matrix of input values and use pmap
+Below is the code necessary to generalise the data extraction into a multiple extraction, simply create a matrix of input values and use pmap to iterate.
 
 ```{r}
 
@@ -70,36 +74,208 @@ all_variables <- c("Turbidity", "Chl_a_sum")
 all_start_dates <- "2022-01-01"
 all_end_dates <- "2022-01-05"
 
-#use expand grid
+#use expand grid to build a simple table of inputs
 all_arguments <- expand.grid(all_variables, all_start_dates, all_end_dates, stringsAsFactors = F)
 
 #map over each argument, this returns a list of data extracts
-test_extract <- purrr::pmap(all_arguments,  function(Var1, Var2, Var3){ereefs_extract(my_sf_object, Var2, Var3, Var1)})
+mutiple_extraction <- pmap(all_arguments,  function(Var1, Var2, Var3){ereefs_extract(my_sf_object, Var2, Var3, Var1)})
 
 #alternatively, you can manually build the table if you want more control (note that two different time spans are requested)
-all_arguments_2 <- data.frame(
-  "AllVariables" = c("Turbidity", "Chl_a_sum", "Turbidity", "Chl_a_sum"),
-  "AllStartDates" = c("2022-01-01", "2022-01-01", "2023-01-01", "2023-01-01"),
-  "AllEndDates" = c("2022-01-05", "2022-01-05", "2023-01-05", "2023-01-05")
+#all_arguments_2 <- data.frame(
+#  "AllVariables" = c("Turbidity", "Chl_a_sum", "Turbidity", "Chl_a_sum"),
+#  "AllStartDates" = c("2022-01-01", "2022-01-01", "2023-01-01", "2023-01-01"),
+#  "AllEndDates" = c("2022-01-05", "2022-01-05", "2023-01-05", "2023-01-05")
+#)
+
+#you can then reproject with the custom function using another map function
+mutiple_extraction <- map(mutiple_extraction, ereefs_reproject)
+
+```
+
+# Multiple Save and Read
+
+To save and read back in the files use the `stars::write_mdim()` and `stars::read_stars()` functions. Below is a method to save a list of files using the same input table that was used to download the data. Then read these files back in
+
+```{r}
+
+#convert each row in the table into a file name
+file_names <- map(1:nrow(all_arguments), \(x) paste(all_arguments[x, ], collapse = "_"))
+
+#walk across file names and save each
+walk2(mutiple_extraction, file_names, \(x,y) write_mdim(x, here("output/{y}.nc")))
+
+#build a list of files with the correct extension
+files_to_read <- list.files()[str_detect(list.files(), ".nc")]
+
+#read in all files
+mutiple_load <- map(files_to_read, read_stars)
+
+```
+
+It is recommend you also include the name/description of the sf object used to extract the data in the file output name(s).
+
+# Full Working Examples
+
+Below are fully realised working examples of the above demonstration. Note that these code chunks have been flagged not to run during a full render of the document, and if you wish to run then you will need to manually run each chunk.
+
+## Dry Tropics
+
+A full extraction of all variables across all years. Note that large extractions need to be broken up into several smaller requests to avoid hitting a memory cap.
+
+```{r}
+#| eval: FALSE
+
+#define the dry tropics region
+dt_marine <- st_read("data/n3_region.gpkg") |> 
+  filter(Region == "Dry Tropics", Environment == "Marine")
+
+#create variables and years
+all_variables <- c("Turbidity", "Chl_a_sum", "DIN", "Secchi")
+years <- 2019:2025
+
+#start table
+all_arguments <- expand.grid(
+  Variable = all_variables,
+  Year = years
 )
 
+#add dates to years, then drop the years column
+all_arguments <- all_arguments |> 
+  mutate(
+    Variable = as.character(Variable),
+    StartDate = paste0(Year, "-01-01"), #the function will take the closest date
+    EndDate = paste0(Year, "-12-31")
+  ) |> 
+  select(-Year)
+
+#map over all inputs and immediately save the object
+pwalk(all_arguments, function(Variable, StartDate, EndDate) {
+
+  #extract the data
+  data_extracted <- ereefs_extract(dt_marine, StartDate, EndDate, Variable)
+
+  #if the extract has any time layers (not completely empty)
+  if (dim(data_extracted)[[3]] > 0){
+
+    #reproject the data
+    data_reprojected <- ereefs_reproject(data_extracted)
+
+    #build a file name
+    file_name <- paste("dry-tropics", Variable, StartDate, EndDate, collapse = "_", sep = "_")
+    
+    #save
+    write_mdim(data_reprojected, paste0(file_name, ".nc"))
+    
+  }
+})
+
 ```
 
+## Wet Tropics
+
+A full extraction of all variables across all years. Note that large extractions need to be broken up into several smaller requests to avoid hitting a memory cap.
 
 ```{r}
+#| eval: FALSE
 
-#how to save data
-stars::write_mdim(final_data, "final.nc")
+#define the dry tropics region
+wt_marine <- st_read("data/n3_region.gpkg") |> 
+  filter(Region == "Wet Tropics", Environment == "Marine")
 
-#how to read data back in
-read_back_in <- stars::read_stars("final.nc")
+#create variables and years
+all_variables <- c("Turbidity", "Chl_a_sum", "DIN", "Secchi")
+years <- 2019:2025
 
-  
+#start table
+all_arguments <- expand.grid(
+  Variable = all_variables,
+  Year = years
+)
+
+#add dates to years, then drop the years column
+all_arguments <- all_arguments |> 
+  mutate(
+    Variable = as.character(Variable),
+    StartDate = paste0(Year, "-01-01"), #the function will take the closest date
+    EndDate = paste0(Year, "-01-04")
+  ) |> 
+  select(-Year)
+
+#map over all inputs and immediately save the object
+pwalk(all_arguments, function(Variable, StartDate, EndDate) {
+
+  #extract the data
+  data_extracted <- ereefs_extract(wt_marine, StartDate, EndDate, Variable)
+
+  #if the extract has any time layers (not completely empty)
+  if (dim(data_extracted)[[3]] > 0){
+
+    #reproject the data
+    data_reprojected <- ereefs_reproject(data_extracted)
+
+    #build a file name
+    file_name <- paste("wet-tropics", Variable, StartDate, EndDate, collapse = "_", sep = "_")
+    
+    #save
+    write_mdim(data_reprojected, paste0(file_name, ".nc"))
+    
+  }
+})
 
 ```
 
-This concludes the data access script.
+## Mackay Whitsunday Isaac
+
+A full extraction of all variables across all years. Note that large extractions need to be broken up into several smaller requests to avoid hitting a memory cap. Further, note that broadly the MWI region cannot handle reprojection. This mostly only effects saving and loading, an alternative save and load method is shown below. It is recommended to test reprojection on a case by case basis, and preference reprojection.
 
 ```{r}
+#| eval: FALSE
+
+#define the dry tropics region
+mwi_marine <- st_read("data/n3_region.gpkg") |> 
+  filter(Region == "Mackay Whitsunday Isaac", Environment == "Marine")
+
+#create variables and years
+all_variables <- c("Turbidity", "Chl_a_sum", "DIN", "Secchi")
+years <- 2019:2025
+
+#start table
+all_arguments <- expand.grid(
+  Variable = all_variables,
+  Year = years
+)
+
+#add dates to years, then drop the years column
+all_arguments <- all_arguments |> 
+  mutate(
+    Variable = as.character(Variable),
+    StartDate = paste0(Year, "-01-01"), #the function will take the closest date
+    EndDate = paste0(Year, "-12-31")
+  ) |> 
+  select(-Year)
+
+#map over all inputs and immediately save the object
+pwalk(all_arguments, function(Variable, StartDate, EndDate) {
+
+  #extract the data
+  data_extracted <- ereefs_extract(mwi_marine, StartDate, EndDate, Variable)
+
+  #if the extract has any time layers (not completely empty)
+  if (dim(data_extracted)[[3]] > 0){
+
+    #the mackay region, broadly, can't handle reprojection. Below is an alternative save and reload method
+
+    #build a file name
+    file_name <- paste("mackay-whitsunday-isaac", Variable, StartDate, EndDate, collapse = "_", sep = "_")
+
+    #save
+    saveRDS(data_extracted, file = paste0(file_name, ".RData"))
+
+    #read back in using
+    #readRDS(paste0(file_name, ".RData"))
+
+  }
+})
 
 ```
+

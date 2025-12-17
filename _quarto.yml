@@ -1,6 +1,6 @@
 project:
   output-dir: "renders" #where do we want the rendered files to be saved?
-execute: 
+execute:
   output: false #should code chunk outputs be shown be default?
 date: "today" #what should the publication date be?
 date-format: long #what style, long = "October 8, 2024"
@@ -8,7 +8,7 @@ title-block-banner: true #do we want a title block banner? (This has our HWP log
 include-after-body: "brand/html_footer.html" #This contains footer material for html report (reuse, citations, logos, etc.)
 format: 
   html:
-    code-fold: true
+    code-fold: false
     code-overflow: wrap
     code-tools: true 
     code-copy: true
@@ -16,6 +16,8 @@ format:
     code-block-bg: "#2683C620" #cool blue (blue falls) at 20% opacity
     embed-resources: true
     monobackgroundcolor: "transparent"
+    toc: true
+    toc-title: "Jump To:"
     theme: 
       - flatly #one of the preset themes
       - brand/html_style_guide.scss #this is a custom theme using the HWP colours
