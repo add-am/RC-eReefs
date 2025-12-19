@@ -1,7 +1,7 @@
 ---
 title: "eReefs Contextual Results - Data Access"
 subtitle: "A Healthy Waters Partnership Analysis"
-description: "This script has been written to create a series of contextual results to be included in the Offshore Marine Zone of the Technical Report."
+description: "A demonstration of downloading, saving, and reloading data extracted from the eReefs modelling suite."
 author: "Adam Shand" 
 format: html
 ---
@@ -27,9 +27,9 @@ A pair of custom functions have been written to assist in the data download and 
 
 You define the area to extract data from using an [sf object](https://r-spatial.github.io/sf/) and you define the time frame by providing a start and end date in the format "YYYY-MM-DD".
 
-# Extract eReefs Data
+# General Set Up
 
-The following code is all that is required to extract eReefs data:
+Before diving in, some general script set up is needed.
 
 ```{r}
 
@@ -45,9 +45,22 @@ library(tmap)
 library(purrr)
 library(stars)
 library(here)
+library(glue)
+
+#define a path to the input (data) and output folders
+data_path <- here("data/")
+output_path <- here("outputs/")
+
+```
+
+# Extract eReefs Data
+
+The following code is all that is required to extract eReefs data:
+
+```{r}
 
 #make an sf object that defines the broad boundary of where to extract data from
-my_sf_object <- st_read(here("data/n3_region.gpkg")) |> 
+my_sf_object <- st_read(glue("{data_path}/n3_region.gpkg")) |> 
   filter(Region == "Dry Tropics", Environment == "Marine")
 
 #read data in using custom function
@@ -78,7 +91,7 @@ all_end_dates <- "2022-01-05"
 all_arguments <- expand.grid(all_variables, all_start_dates, all_end_dates, stringsAsFactors = F)
 
 #map over each argument, this returns a list of data extracts
-mutiple_extraction <- pmap(all_arguments,  function(Var1, Var2, Var3){ereefs_extract(my_sf_object, Var2, Var3, Var1)})
+multiple_extraction <- pmap(all_arguments,  function(Var1, Var2, Var3){ereefs_extract(my_sf_object, Var2, Var3, Var1)})
 
 #alternatively, you can manually build the table if you want more control (note that two different time spans are requested)
 #all_arguments_2 <- data.frame(
@@ -88,7 +101,7 @@ mutiple_extraction <- pmap(all_arguments,  function(Var1, Var2, Var3){ereefs_ext
 #)
 
 #you can then reproject with the custom function using another map function
-mutiple_extraction <- map(mutiple_extraction, ereefs_reproject)
+multiple_extraction <- map(multiple_extraction, ereefs_reproject)
 
 ```
 
@@ -101,14 +114,14 @@ To save and read back in the files use the `stars::write_mdim()` and `stars::rea
 #convert each row in the table into a file name
 file_names <- map(1:nrow(all_arguments), \(x) paste(all_arguments[x, ], collapse = "_"))
 
-#walk across file names and save each
-walk2(mutiple_extraction, file_names, \(x,y) write_mdim(x, here("output/{y}.nc")))
+#walk across file names and save each (hashed out to not save things unecessarily)
+#walk2(multiple_extraction, file_names, \(x, y) write_mdim(x, glue("{output_path}/{y}.nc")))
 
 #build a list of files with the correct extension
-files_to_read <- list.files()[str_detect(list.files(), ".nc")]
+#files_to_read <- list.files(glue("{output_path}"))[str_detect(list.files(glue("{output_path}")), ".nc")]
 
 #read in all files
-mutiple_load <- map(files_to_read, read_stars)
+#mutiple_load <- map(files_to_read, \(x) read_stars(glue("{output_path}/{x}")))
 
 ```
 
@@ -126,7 +139,7 @@ A full extraction of all variables across all years. Note that large extractions
 #| eval: FALSE
 
 #define the dry tropics region
-dt_marine <- st_read("data/n3_region.gpkg") |> 
+dt_marine <- st_read(glue("{data_path}/n3_region.gpkg")) |> 
   filter(Region == "Dry Tropics", Environment == "Marine")
 
 #create variables and years
@@ -160,11 +173,14 @@ pwalk(all_arguments, function(Variable, StartDate, EndDate) {
     #reproject the data
     data_reprojected <- ereefs_reproject(data_extracted)
 
-    #build a file name
-    file_name <- paste("dry-tropics", Variable, StartDate, EndDate, collapse = "_", sep = "_")
+    #create the folder to save each file in
+    if (!dir.exists(glue("{output_path}/dry-tropics"))){dir.create(glue("{output_path}/dry-tropics"))}
+
+    #build the file path
+    file_path <- glue("{output_path}/dry-tropics/{Variable}_{StartDate}_{EndDate}.nc")
     
     #save
-    write_mdim(data_reprojected, paste0(file_name, ".nc"))
+    write_mdim(data_reprojected, file_path)
     
   }
 })
@@ -179,27 +195,10 @@ A full extraction of all variables across all years. Note that large extractions
 #| eval: FALSE
 
 #define the dry tropics region
-wt_marine <- st_read("data/n3_region.gpkg") |> 
+wt_marine <- st_read(glue("{data_path}/n3_region.gpkg")) |> 
   filter(Region == "Wet Tropics", Environment == "Marine")
 
-#create variables and years
-all_variables <- c("Turbidity", "Chl_a_sum", "DIN", "Secchi")
-years <- 2019:2025
-
-#start table
-all_arguments <- expand.grid(
-  Variable = all_variables,
-  Year = years
-)
-
-#add dates to years, then drop the years column
-all_arguments <- all_arguments |> 
-  mutate(
-    Variable = as.character(Variable),
-    StartDate = paste0(Year, "-01-01"), #the function will take the closest date
-    EndDate = paste0(Year, "-01-04")
-  ) |> 
-  select(-Year)
+#use the same arguments table
 
 #map over all inputs and immediately save the object
 pwalk(all_arguments, function(Variable, StartDate, EndDate) {
@@ -214,7 +213,7 @@ pwalk(all_arguments, function(Variable, StartDate, EndDate) {
     data_reprojected <- ereefs_reproject(data_extracted)
 
     #build a file name
-    file_name <- paste("wet-tropics", Variable, StartDate, EndDate, collapse = "_", sep = "_")
+    file_name <- paste("wet-tropics/", Variable, StartDate, EndDate, collapse = "_", sep = "_")
     
     #save
     write_mdim(data_reprojected, paste0(file_name, ".nc"))
@@ -232,27 +231,10 @@ A full extraction of all variables across all years. Note that large extractions
 #| eval: FALSE
 
 #define the dry tropics region
-mwi_marine <- st_read("data/n3_region.gpkg") |> 
+mwi_marine <- st_read(glue("{data_path}/n3_region.gpkg")) |> 
   filter(Region == "Mackay Whitsunday Isaac", Environment == "Marine")
 
-#create variables and years
-all_variables <- c("Turbidity", "Chl_a_sum", "DIN", "Secchi")
-years <- 2019:2025
-
-#start table
-all_arguments <- expand.grid(
-  Variable = all_variables,
-  Year = years
-)
-
-#add dates to years, then drop the years column
-all_arguments <- all_arguments |> 
-  mutate(
-    Variable = as.character(Variable),
-    StartDate = paste0(Year, "-01-01"), #the function will take the closest date
-    EndDate = paste0(Year, "-12-31")
-  ) |> 
-  select(-Year)
+#use the same arguments table
 
 #map over all inputs and immediately save the object
 pwalk(all_arguments, function(Variable, StartDate, EndDate) {
@@ -266,7 +248,7 @@ pwalk(all_arguments, function(Variable, StartDate, EndDate) {
     #the mackay region, broadly, can't handle reprojection. Below is an alternative save and reload method
 
     #build a file name
-    file_name <- paste("mackay-whitsunday-isaac", Variable, StartDate, EndDate, collapse = "_", sep = "_")
+    file_name <- paste("mackay-whitsunday-isaac/", Variable, StartDate, EndDate, collapse = "_", sep = "_")
 
     #save
     saveRDS(data_extracted, file = paste0(file_name, ".RData"))
